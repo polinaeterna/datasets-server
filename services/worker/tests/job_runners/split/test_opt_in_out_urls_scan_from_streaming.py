@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2022 The HuggingFace Authors.
+# Copyright 2023 The HuggingFace Authors.
 
 from asyncio import Semaphore
 from dataclasses import replace
@@ -10,25 +10,28 @@ from unittest.mock import patch
 import pytest
 from aiohttp import ClientSession
 from aiolimiter import AsyncLimiter
-from libcommon.constants import PROCESSING_STEP_SPLIT_OPT_IN_OUT_URLS_SCAN_VERSION
-from libcommon.exceptions import CustomError
-from libcommon.processing_graph import ProcessingStep
-from libcommon.queue import Priority
+from libcommon.constants import (
+    PROCESSING_STEP_SPLIT_IMAGE_URL_COLUMNS_VERSION,
+    PROCESSING_STEP_SPLIT_OPT_IN_OUT_URLS_SCAN_VERSION,
+)
+from libcommon.exceptions import ExternalServerError
+from libcommon.processing_graph import ProcessingGraph
 from libcommon.resources import CacheMongoResource, QueueMongoResource
-from libcommon.simple_cache import get_response, upsert_response
+from libcommon.simple_cache import upsert_response
+from libcommon.utils import Priority
 
 from worker.config import AppConfig
+from worker.dtos import ImageUrlColumnsResponse
 from worker.job_runners.split.opt_in_out_urls_scan_from_streaming import (
-    ExternalServerError,
     SplitOptInOutUrlsScanJobRunner,
     check_spawning,
 )
 from worker.resources import LibrariesResource
 
 from ...constants import CI_SPAWNING_TOKEN
-from ...fixtures.hub import HubDatasets, get_default_config_split
+from ...fixtures.hub import HubDatasetTest, get_default_config_split
 
-GetJobRunner = Callable[[str, str, str, AppConfig, bool], SplitOptInOutUrlsScanJobRunner]
+GetJobRunner = Callable[[str, str, str, AppConfig], SplitOptInOutUrlsScanJobRunner]
 
 
 async def mock_check_spawning(
@@ -48,110 +51,77 @@ def get_job_runner(
         config: str,
         split: str,
         app_config: AppConfig,
-        force: bool = False,
     ) -> SplitOptInOutUrlsScanJobRunner:
+        processing_step_name = SplitOptInOutUrlsScanJobRunner.get_job_type()
+        processing_graph = ProcessingGraph(
+            {
+                "dataset-level": {"input_type": "dataset"},
+                "config-level": {"input_type": "dataset", "triggered_by": "dataset-level"},
+                processing_step_name: {
+                    "input_type": "dataset",
+                    "job_runner_version": SplitOptInOutUrlsScanJobRunner.get_job_runner_version(),
+                    "triggered_by": "config-level",
+                },
+            }
+        )
         return SplitOptInOutUrlsScanJobRunner(
             job_info={
                 "type": SplitOptInOutUrlsScanJobRunner.get_job_type(),
-                "dataset": dataset,
-                "config": config,
-                "split": split,
+                "params": {
+                    "dataset": dataset,
+                    "revision": "revision",
+                    "config": config,
+                    "split": split,
+                },
                 "job_id": "job_id",
-                "force": force,
                 "priority": Priority.NORMAL,
+                "difficulty": 50,
             },
             app_config=app_config,
-            processing_step=ProcessingStep(
-                name=SplitOptInOutUrlsScanJobRunner.get_job_type(),
-                input_type="split",
-                requires=[],
-                required_by_dataset_viewer=True,
-                ancestors=[],
-                children=[],
-                parents=[],
-                job_runner_version=SplitOptInOutUrlsScanJobRunner.get_job_runner_version(),
-            ),
+            processing_step=processing_graph.get_processing_step(processing_step_name),
             hf_datasets_cache=libraries_resource.hf_datasets_cache,
         )
 
     return _get_job_runner
 
 
-FIRST_ROWS_WITHOUT_OPT_IN_OUT_URLS = {
-    "features": [
-        {
-            "feature_idx": 0,
-            "name": "col1",
-            "type": {
-                "dtype": "int64",
-                "_type": "Value",
-            },
-        },
-        {
-            "feature_idx": 1,
-            "name": "col2",
-            "type": {
-                "dtype": "int64",
-                "_type": "Value",
-            },
-        },
-        {
-            "feature_idx": 2,
-            "name": "col3",
-            "type": {
-                "dtype": "float64",
-                "_type": "Value",
-            },
-        },
-    ],
-    "rows": [],
-}
+IMAGE_URL_COLUMNS_RESPONSE_EMPTY: ImageUrlColumnsResponse = {"columns": []}
 
 
-FIRST_ROWS_WITH_OPT_IN_OUT_URLS = {
-    "features": [
-        {
-            "feature_idx": 0,
-            "name": "col",
-            "type": {
-                "dtype": "string",
-                "_type": "Value",
-            },
-        }
-    ],
-    "rows": [
-        {"row_idx": 0, "row": {"col": "http://testurl.test/test_image.jpg"}, "truncated_cells": []},
-        {"row_idx": 1, "row": {"col": "http://testurl.test/test_image2.jpg"}, "truncated_cells": []},
-        {"row_idx": 2, "row": {"col": "other"}, "truncated_cells": []},
-    ],
+IMAGE_URL_COLUMNS_RESPONSE_WITH_DATA: ImageUrlColumnsResponse = {"columns": ["col"]}
+
+
+DEFAULT_EMPTY_RESPONSE = {
+    "has_urls_columns": False,
+    "num_scanned_rows": 0,
+    "opt_in_urls": [],
+    "opt_out_urls": [],
+    "urls_columns": [],
+    "num_opt_out_urls": 0,
+    "num_opt_in_urls": 0,
+    "num_urls": 0,
+    "full_scan": None,
 }
 
 
 @pytest.mark.parametrize(
-    "name,upstream_content,expected_content",
+    "name,rows_max_number,upstream_content,expected_content",
     [
         (
             "public",
-            FIRST_ROWS_WITHOUT_OPT_IN_OUT_URLS,
-            {
-                "has_urls_columns": False,
-                "num_scanned_rows": 0,
-                "opt_in_urls": [],
-                "opt_out_urls": [],
-                "urls_columns": [],
-                "num_opt_out_urls": 0,
-                "num_opt_in_urls": 0,
-                "num_urls": 0,
-            },
+            100_000,
+            IMAGE_URL_COLUMNS_RESPONSE_EMPTY,
+            DEFAULT_EMPTY_RESPONSE,
         ),
         (
             "spawning_opt_in_out",
-            FIRST_ROWS_WITH_OPT_IN_OUT_URLS,
+            100_000,  # dataset has less rows
+            IMAGE_URL_COLUMNS_RESPONSE_WITH_DATA,
             {
                 "has_urls_columns": True,
                 "num_scanned_rows": 4,
                 "opt_in_urls": [
-                    {"url": "http://testurl.test/test_image3-optIn.jpg", "row_idx": 3, "column_name": "col"}
+                    {"url": "http://testurl.test/test_image3-optIn.png", "row_idx": 3, "column_name": "col"}
                 ],
                 "opt_out_urls": [
                     {"url": "http://testurl.test/test_image-optOut.jpg", "row_idx": 0, "column_name": "col"}
@@ -160,97 +130,135 @@ FIRST_ROWS_WITH_OPT_IN_OUT_URLS = {
                 "num_opt_out_urls": 1,
                 "num_opt_in_urls": 1,
                 "num_urls": 4,
+                "full_scan": True,
+            },
+        ),
+        (
+            "spawning_opt_in_out",
+            3,  # dataset has more rows
+            IMAGE_URL_COLUMNS_RESPONSE_WITH_DATA,
+            {
+                "has_urls_columns": True,
+                "num_scanned_rows": 3,
+                "opt_in_urls": [],
+                "opt_out_urls": [
+                    {"url": "http://testurl.test/test_image-optOut.jpg", "row_idx": 0, "column_name": "col"}
+                ],
+                "urls_columns": ["col"],
+                "num_opt_out_urls": 1,
+                "num_opt_in_urls": 0,
+                "num_urls": 3,
+                "full_scan": False,
+            },
+        ),
+        (
+            "spawning_opt_in_out",
+            4,  # dataset has same amount of rows
+            IMAGE_URL_COLUMNS_RESPONSE_WITH_DATA,
+            {
+                "has_urls_columns": True,
+                "num_scanned_rows": 4,
+                "opt_in_urls": [
+                    {"url": "http://testurl.test/test_image3-optIn.png", "row_idx": 3, "column_name": "col"}
+                ],
+                "opt_out_urls": [
+                    {"url": "http://testurl.test/test_image-optOut.jpg", "row_idx": 0, "column_name": "col"}
+                ],
+                "urls_columns": ["col"],
+                "num_opt_out_urls": 1,
+                "num_opt_in_urls": 1,
+                "num_urls": 4,
+                "full_scan": True,
             },
         ),
     ],
 )
 def test_compute(
-    hub_datasets: HubDatasets,
+    hub_responses_public: HubDatasetTest,
+    hub_responses_spawning_opt_in_out: HubDatasetTest,
     app_config: AppConfig,
     get_job_runner: GetJobRunner,
     name: str,
+    rows_max_number: int,
     upstream_content: Mapping[str, Any],
     expected_content: Mapping[str, Any],
 ) -> None:
-    dataset, config, split = get_default_config_split(hub_datasets[name]["name"])
-    job_runner = get_job_runner(dataset, config, split, app_config, False)
+    hub_datasets = {"public": hub_responses_public, "spawning_opt_in_out": hub_responses_spawning_opt_in_out}
+    dataset = hub_datasets[name]["name"]
+    config, split = get_default_config_split()
+    job_runner = get_job_runner(
+        dataset,
+        config,
+        split,
+        replace(app_config, urls_scan=replace(app_config.urls_scan, rows_max_number=rows_max_number)),
+    )
     upsert_response(
-        kind="split-first-rows-from-streaming",
+        kind="split-image-url-columns",
         dataset=dataset,
         config=config,
         split=split,
         content=upstream_content,
         dataset_git_revision="dataset_git_revision",
-        job_runner_version=PROCESSING_STEP_SPLIT_OPT_IN_OUT_URLS_SCAN_VERSION,
+        job_runner_version=PROCESSING_STEP_SPLIT_IMAGE_URL_COLUMNS_VERSION,
         progress=1.0,
         http_status=HTTPStatus.OK,
     )
     with patch("worker.job_runners.split.opt_in_out_urls_scan_from_streaming.check_spawning", mock_check_spawning):
-        assert job_runner.process()
-    cached_response = get_response(
-        kind=job_runner.processing_step.cache_kind, dataset=dataset, config=config, split=split
-    )
-    assert cached_response
-    assert cached_response["content"] == expected_content
-    assert cached_response["http_status"] == HTTPStatus.OK
-    assert cached_response["error_code"] is None
+        response = job_runner.compute()
+    assert response
+    assert response.content == expected_content
 
 
 @pytest.mark.parametrize(
-    "dataset,columns_max_number,upstream_content,upstream_status,error_code,status_code",
+    "dataset,columns_max_number,upstream_content,upstream_status,exception_name",
     [
-        ("doesnotexist", 10, {}, HTTPStatus.OK, "CachedResponseNotFound", HTTPStatus.NOT_FOUND),
-        ("wrong_format", 10, {}, HTTPStatus.OK, "PreviousStepFormatError", HTTPStatus.INTERNAL_SERVER_ERROR),
+        ("doesnotexist", 10, {}, HTTPStatus.OK, "CachedArtifactError"),
+        ("wrong_format", 10, {}, HTTPStatus.OK, "PreviousStepFormatError"),
         (
             "upstream_failed",
             10,
             {},
             HTTPStatus.INTERNAL_SERVER_ERROR,
-            "PreviousStepError",
-            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "CachedArtifactError",
         ),
         (
             "info_error",
             10,
-            FIRST_ROWS_WITHOUT_OPT_IN_OUT_URLS,
+            IMAGE_URL_COLUMNS_RESPONSE_EMPTY,
             HTTPStatus.OK,
             "InfoError",
-            HTTPStatus.INTERNAL_SERVER_ERROR,
         ),
         (
             "too_many_columns",
             0,
-            FIRST_ROWS_WITH_OPT_IN_OUT_URLS,
+            IMAGE_URL_COLUMNS_RESPONSE_WITH_DATA,
             HTTPStatus.OK,
             "TooManyColumnsError",
-            HTTPStatus.INTERNAL_SERVER_ERROR,
         ),
     ],
 )
 def test_compute_failed(
     app_config: AppConfig,
-    hub_datasets: HubDatasets,
+    hub_responses_spawning_opt_in_out: HubDatasetTest,
     get_job_runner: GetJobRunner,
     dataset: str,
     columns_max_number: int,
     upstream_content: Mapping[str, Any],
     upstream_status: HTTPStatus,
-    error_code: str,
-    status_code: HTTPStatus,
+    exception_name: str,
 ) -> None:
     if dataset == "too_many_columns":
-        dataset = hub_datasets["spawning_opt_in_out"]["name"]
-    dataset, config, split = get_default_config_split(dataset)
+        dataset = hub_responses_spawning_opt_in_out["name"]
+    config, split = get_default_config_split()
     job_runner = get_job_runner(
         dataset,
         config,
         split,
         replace(app_config, urls_scan=replace(app_config.urls_scan, columns_max_number=columns_max_number)),
-        False,
     )
     if dataset != "doesnotexist":
         upsert_response(
-            kind="split-first-rows-from-streaming",
+            kind="split-image-url-columns",
             dataset=dataset,
             config=config,
             split=split,
@@ -260,10 +268,9 @@ def test_compute_failed(
             progress=1.0,
             http_status=upstream_status,
         )
-    with pytest.raises(CustomError) as exc_info:
+    with pytest.raises(Exception) as exc_info:
         job_runner.compute()
-    assert exc_info.value.status_code == status_code
-    assert exc_info.value.code == error_code
+    assert exc_info.typename == exception_name
 
 
 def test_compute_error_from_spawning(
@@ -271,20 +278,20 @@ def test_compute_error_from_spawning(
     get_job_runner: GetJobRunner,
     hub_public_spawning_opt_in_out: str,
 ) -> None:
-    dataset, config, split = get_default_config_split(hub_public_spawning_opt_in_out)
+    dataset = hub_public_spawning_opt_in_out
+    config, split = get_default_config_split()
     job_runner = get_job_runner(
         dataset,
         config,
         split,
         replace(app_config, urls_scan=replace(app_config.urls_scan, spawning_url="wrong_url")),
-        False,
     )
     upsert_response(
-        kind="split-first-rows-from-streaming",
+        kind="split-image-url-columns",
         dataset=dataset,
         config=config,
         split=split,
-        content=FIRST_ROWS_WITH_OPT_IN_OUT_URLS,
+        content=IMAGE_URL_COLUMNS_RESPONSE_WITH_DATA,
         dataset_git_revision="dataset_git_revision",
         job_runner_version=PROCESSING_STEP_SPLIT_OPT_IN_OUT_URLS_SCAN_VERSION,
         progress=1.0,
@@ -294,6 +301,12 @@ def test_compute_error_from_spawning(
         job_runner.compute()
 
 
+@pytest.mark.skip(
+    reason=(
+        "Temporarily disabled, we can't use secrets on fork repos. See"
+        " https://github.com/huggingface/datasets-server/issues/1085"
+    )
+)
 @pytest.mark.asyncio
 async def test_real_check_spawning_response(app_config: AppConfig) -> None:
     semaphore = Semaphore(value=10)

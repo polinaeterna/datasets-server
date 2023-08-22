@@ -2,18 +2,17 @@
 # Copyright 2022 The HuggingFace Authors.
 
 import logging
-from typing import Any, List, Literal, Optional, TypedDict
+from typing import Any, Literal, Optional, TypedDict
 
 from jsonschema import ValidationError, validate
-from libcommon.dataset import DatasetError
-from libcommon.operations import delete_dataset, update_dataset
-from libcommon.processing_graph import ProcessingStep
-from libcommon.queue import Priority
+from libapi.utils import Endpoint, get_response
+from libcommon.exceptions import CustomError, DatasetRevisionEmptyError
+from libcommon.operations import backfill_dataset, delete_dataset
+from libcommon.processing_graph import ProcessingGraph
+from libcommon.prometheus import StepProfiler
+from libcommon.utils import Priority
 from starlette.requests import Request
 from starlette.responses import Response
-
-from api.prometheus import StepProfiler
-from api.utils import Endpoint, get_response
 
 schema = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -24,6 +23,7 @@ schema = {
         "repo": {
             "type": "object",
             "properties": {
+                "headSha": {"type": "string"},
                 "name": {"type": "string"},
                 "type": {"type": "string", "enum": ["dataset", "model", "space"]},
             },
@@ -34,9 +34,13 @@ schema = {
 }
 
 
-class MoonWebhookV2PayloadRepo(TypedDict):
+class _MoonWebhookV2PayloadRepo(TypedDict):
     type: Literal["model", "dataset", "space"]
     name: str
+
+
+class MoonWebhookV2PayloadRepo(_MoonWebhookV2PayloadRepo, total=False):
+    headSha: Optional[str]
 
 
 class MoonWebhookV2Payload(TypedDict):
@@ -56,11 +60,9 @@ def parse_payload(json: Any) -> MoonWebhookV2Payload:
 
 
 def process_payload(
-    init_processing_steps: List[ProcessingStep],
+    processing_graph: ProcessingGraph,
     payload: MoonWebhookV2Payload,
-    hf_endpoint: str,
-    hf_token: Optional[str] = None,
-    hf_timeout_seconds: Optional[float] = None,
+    cache_max_days: int,
     trust_sender: bool = False,
 ) -> None:
     if payload["repo"]["type"] != "dataset":
@@ -69,41 +71,37 @@ def process_payload(
     if dataset is None:
         return
     event = payload["event"]
-    if event in ["add", "update"]:
-        update_dataset(
-            dataset=dataset,
-            init_processing_steps=init_processing_steps,
-            hf_endpoint=hf_endpoint,
-            hf_token=hf_token,
-            force=False,
-            priority=Priority.NORMAL,
-            hf_timeout_seconds=hf_timeout_seconds,
-            do_check_support=False,  # always create a job, even if the dataset is not supported
-        )
-    elif trust_sender:
+    if event == "remove":
         # destructive actions (delete, move) require a trusted sender
-        if event == "move" and (moved_to := payload["movedTo"]):
-            update_dataset(
-                dataset=moved_to,
-                init_processing_steps=init_processing_steps,
-                hf_token=hf_token,
-                hf_endpoint=hf_endpoint,
-                force=False,
-                priority=Priority.NORMAL,
-                hf_timeout_seconds=hf_timeout_seconds,
-                do_check_support=False,
-            )
+        if trust_sender:
             delete_dataset(dataset=dataset)
-        elif event == "remove":
+        return
+    revision = payload["repo"]["headSha"] if "headSha" in payload["repo"] else None
+    if revision is None:
+        raise DatasetRevisionEmptyError(message=f"Dataset {dataset} has no revision")
+    if event in ["add", "update"]:
+        backfill_dataset(
+            dataset=dataset,
+            revision=revision,
+            processing_graph=processing_graph,
+            priority=Priority.NORMAL,
+            cache_max_days=cache_max_days,
+        )
+    elif event == "move" and (moved_to := payload["movedTo"]):
+        # destructive actions (delete, move) require a trusted sender
+        if trust_sender:
+            backfill_dataset(
+                dataset=moved_to,
+                revision=revision,
+                processing_graph=processing_graph,
+                priority=Priority.NORMAL,
+                cache_max_days=cache_max_days,
+            )
             delete_dataset(dataset=dataset)
 
 
 def create_webhook_endpoint(
-    init_processing_steps: List[ProcessingStep],
-    hf_endpoint: str,
-    hf_token: Optional[str] = None,
-    hf_webhook_secret: Optional[str] = None,
-    hf_timeout_seconds: Optional[float] = None,
+    processing_graph: ProcessingGraph, cache_max_days: int, hf_webhook_secret: Optional[str] = None
 ) -> Endpoint:
     async def webhook_endpoint(request: Request) -> Response:
         with StepProfiler(method="webhook_endpoint", step="all"):
@@ -140,14 +138,12 @@ def create_webhook_endpoint(
             with StepProfiler(method="webhook_endpoint", step="process payload"):
                 try:
                     process_payload(
-                        init_processing_steps=init_processing_steps,
+                        processing_graph=processing_graph,
                         payload=payload,
-                        hf_endpoint=hf_endpoint,
-                        hf_token=hf_token,
-                        hf_timeout_seconds=hf_timeout_seconds,
                         trust_sender=trust_sender,
+                        cache_max_days=cache_max_days,
                     )
-                except DatasetError as e:
+                except CustomError as e:
                     content = {"status": "error", "error": "the dataset is not supported"}
                     dataset = payload["repo"]["name"]
                     logging.debug(f"/webhook: the dataset {dataset} is not supported. JSON: {json}. Error: {e}")

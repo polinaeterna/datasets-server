@@ -5,18 +5,15 @@ from http import HTTPStatus
 from typing import Any, Callable, List
 
 import pytest
-from libcommon.processing_graph import ProcessingStep
-from libcommon.queue import Priority
+from libcommon.exceptions import PreviousStepFormatError
+from libcommon.processing_graph import ProcessingGraph
 from libcommon.resources import CacheMongoResource, QueueMongoResource
-from libcommon.simple_cache import upsert_response
+from libcommon.simple_cache import CachedArtifactError, upsert_response
+from libcommon.utils import Priority
 
 from worker.config import AppConfig
-from worker.job_runner import PreviousStepError
-from worker.job_runners.dataset.info import (
-    DatasetInfoJobRunner,
-    PreviousStepFormatError,
-)
-from worker.utils import PreviousJob
+from worker.dtos import PreviousJob
+from worker.job_runners.dataset.info import DatasetInfoJobRunner
 
 from ..config.test_info import CONFIG_INFO_1, CONFIG_INFO_2, DATASET_INFO_OK
 from ..utils import UpstreamResponse
@@ -28,11 +25,11 @@ def prepare_and_clean_mongo(app_config: AppConfig) -> None:
     pass
 
 
-GetJobRunner = Callable[[str, AppConfig, bool], DatasetInfoJobRunner]
+GetJobRunner = Callable[[str, AppConfig], DatasetInfoJobRunner]
 
 
 UPSTREAM_RESPONSE_CONFIG_NAMES: UpstreamResponse = UpstreamResponse(
-    kind="/config-names",
+    kind="dataset-config-names",
     dataset="dataset_ok",
     config=None,
     http_status=HTTPStatus.OK,
@@ -49,7 +46,7 @@ UPSTREAM_RESPONSE_CONFIG_INFO_1: UpstreamResponse = UpstreamResponse(
     dataset="dataset_ok",
     config="config_1",
     http_status=HTTPStatus.OK,
-    content={"dataset_info": CONFIG_INFO_1},
+    content={"dataset_info": CONFIG_INFO_1, "partial": False},
 )
 
 UPSTREAM_RESPONSE_CONFIG_INFO_2: UpstreamResponse = UpstreamResponse(
@@ -57,7 +54,7 @@ UPSTREAM_RESPONSE_CONFIG_INFO_2: UpstreamResponse = UpstreamResponse(
     dataset="dataset_ok",
     config="config_2",
     http_status=HTTPStatus.OK,
-    content={"dataset_info": CONFIG_INFO_2},
+    content={"dataset_info": CONFIG_INFO_2, "partial": False},
 )
 
 EXPECTED_OK = (
@@ -65,6 +62,7 @@ EXPECTED_OK = (
         "dataset_info": DATASET_INFO_OK,
         "pending": [],
         "failed": [],
+        "partial": False,
     },
     1.0,
 )
@@ -83,6 +81,7 @@ EXPECTED_PARTIAL_PENDING = (
             )
         ],
         "failed": [],
+        "partial": False,
     },
     0.5,
 )
@@ -101,6 +100,7 @@ EXPECTED_PARTIAL_FAILED = (
                 split=None,
             )
         ],
+        "partial": False,
     },
     1.0,
 )
@@ -114,30 +114,31 @@ def get_job_runner(
     def _get_job_runner(
         dataset: str,
         app_config: AppConfig,
-        force: bool = False,
     ) -> DatasetInfoJobRunner:
+        processing_step_name = DatasetInfoJobRunner.get_job_type()
+        processing_graph = ProcessingGraph(
+            {
+                processing_step_name: {
+                    "input_type": "dataset",
+                    "job_runner_version": DatasetInfoJobRunner.get_job_runner_version(),
+                }
+            }
+        )
         return DatasetInfoJobRunner(
             job_info={
                 "type": DatasetInfoJobRunner.get_job_type(),
-                "dataset": dataset,
-                "config": None,
-                "split": None,
+                "params": {
+                    "dataset": dataset,
+                    "revision": "revision",
+                    "config": None,
+                    "split": None,
+                },
                 "job_id": "job_id",
-                "force": force,
                 "priority": Priority.NORMAL,
+                "difficulty": 50,
             },
-            common_config=app_config.common,
-            worker_config=app_config.worker,
-            processing_step=ProcessingStep(
-                name=DatasetInfoJobRunner.get_job_type(),
-                input_type="dataset",
-                requires=[],
-                required_by_dataset_viewer=False,
-                ancestors=[],
-                children=[],
-                parents=[],
-                job_runner_version=DatasetInfoJobRunner.get_job_runner_version(),
-            ),
+            app_config=app_config,
+            processing_step=processing_graph.get_processing_step(processing_step_name),
         )
 
     return _get_job_runner
@@ -185,14 +186,14 @@ def get_job_runner(
             "status_error",
             [
                 UpstreamResponse(
-                    kind="/config-names",
+                    kind="dataset-config-names",
                     dataset="status_error",
                     config=None,
                     http_status=HTTPStatus.NOT_FOUND,
                     content={"error": "error"},
                 )
             ],
-            PreviousStepError.__name__,
+            CachedArtifactError.__name__,
             None,
             True,
         ),
@@ -200,7 +201,7 @@ def get_job_runner(
             "format_error",
             [
                 UpstreamResponse(
-                    kind="/config-names",
+                    kind="dataset-config-names",
                     dataset="format_error",
                     config=None,
                     http_status=HTTPStatus.OK,
@@ -224,11 +225,11 @@ def test_compute(
 ) -> None:
     for upstream_response in upstream_responses:
         upsert_response(**upstream_response)
-    job_runner = get_job_runner(dataset, app_config, False)
+    job_runner = get_job_runner(dataset, app_config)
     if should_raise:
         with pytest.raises(Exception) as e:
             job_runner.compute()
-        assert e.type.__name__ == expected_error_code
+        assert e.typename == expected_error_code
     else:
         compute_result = job_runner.compute()
         assert compute_result.content == expected[0]
@@ -237,6 +238,6 @@ def test_compute(
 
 def test_doesnotexist(app_config: AppConfig, get_job_runner: GetJobRunner) -> None:
     dataset = "doesnotexist"
-    job_runner = get_job_runner(dataset, app_config, False)
-    with pytest.raises(PreviousStepError):
+    job_runner = get_job_runner(dataset, app_config)
+    with pytest.raises(CachedArtifactError):
         job_runner.compute()

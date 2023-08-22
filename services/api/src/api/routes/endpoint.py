@@ -4,30 +4,33 @@
 import logging
 from abc import ABC, abstractmethod
 from http import HTTPStatus
-from typing import List, Mapping, Optional, Tuple
+from typing import List, Mapping, Optional, Tuple, TypedDict
 
-from libcommon.dataset import DatasetError
-from libcommon.operations import PreviousStepError, check_in_process
-from libcommon.processing_graph import InputType, ProcessingGraph, ProcessingStep
-from libcommon.simple_cache import CacheEntry, DoesNotExist, get_response
-from starlette.requests import Request
-from starlette.responses import Response
-
-from api.authentication import auth_check
-from api.config import EndpointConfig
-from api.prometheus import StepProfiler
-from api.utils import (
-    ApiCustomError,
-    Endpoint,
+from libapi.authentication import auth_check
+from libapi.exceptions import (
+    ApiError,
     MissingRequiredParameterError,
-    ResponseNotFoundError,
-    ResponseNotReadyError,
-    UnexpectedError,
+    UnexpectedApiError,
+)
+from libapi.utils import (
+    Endpoint,
     are_valid_parameters,
     get_json_api_error_response,
     get_json_error_response,
     get_json_ok_response,
+    try_backfill_dataset_then_raise,
 )
+from libcommon.processing_graph import InputType, ProcessingGraph, ProcessingStep
+from libcommon.prometheus import StepProfiler
+from libcommon.simple_cache import (
+    CACHED_RESPONSE_NOT_FOUND,
+    CacheEntry,
+    get_best_response,
+)
+from starlette.requests import Request
+from starlette.responses import Response
+
+from api.config import EndpointConfig
 
 StepsByInputType = Mapping[InputType, List[ProcessingStep]]
 
@@ -40,12 +43,17 @@ class EndpointsDefinition:
     steps_by_input_type_and_endpoint: StepsByInputTypeAndEndpoint
 
     def __init__(self, graph: ProcessingGraph, endpoint_config: EndpointConfig):
+        processing_step_names_by_input_type_and_endpoint = (
+            endpoint_config.processing_step_names_by_input_type_and_endpoint.items()
+        )
         self.steps_by_input_type_and_endpoint = {
             endpoint: {
-                input_type: [graph.get_step(step_name) for step_name in step_names]
-                for input_type, step_names in step_names_by_input_type.items()
+                input_type: [
+                    graph.get_processing_step(processing_step_name) for processing_step_name in processing_step_names
+                ]
+                for input_type, processing_step_names in processing_step_names_by_input_type.items()
             }
-            for endpoint, step_names_by_input_type in endpoint_config.step_names_by_input_type_and_endpoint.items()
+            for endpoint, processing_step_names_by_input_type in processing_step_names_by_input_type_and_endpoint
         }
 
 
@@ -54,60 +62,70 @@ def get_cache_entry_from_steps(
     dataset: str,
     config: Optional[str],
     split: Optional[str],
-    init_processing_steps: List[ProcessingStep],
+    processing_graph: ProcessingGraph,
+    cache_max_days: int,
     hf_endpoint: str,
     hf_token: Optional[str] = None,
+    hf_timeout_seconds: Optional[float] = None,
 ) -> CacheEntry:
     """Gets the cache from the first successful step in the processing steps list.
     If no successful result is found, it will return the last one even if it's an error,
     Checks if job is still in progress by each processing step in case of no entry found.
     Raises:
-        - [`~libcommon.dataset.AskAccessHubRequestError`]: if the request to the Hub to get access to the
-            dataset failed or timed out.
-        - [`~libcommon.dataset.DatasetInfoHubRequestError`]: if the request to the Hub to get the dataset
-            info failed or timed out.
-        - [`~libcommon.operations.PreviousStepError`]: a previous step has an error
-        - [`~libcommon.dataset.DatasetError`]: if the dataset could not be accessed or is not supported
-        - [`~api.utils.ResponseNotFoundError`]: if no result is found.
-        - [`~api.utils.ResponseNotReadyError`]: if the response is not ready yet.
+        - [`~utils.ResponseNotFoundError`]
+          if no result is found.
+        - [`~utils.ResponseNotReadyError`]
+          if the response is not ready yet.
 
     Returns: the cached record
     """
-    last_result = None
-    for processing_step in processing_steps:
-        try:
-            last_result = get_response(
-                kind=processing_step.cache_kind,
-                dataset=dataset,
-                config=config,
-                split=split,
-            )
+    kinds = [processing_step.cache_kind for processing_step in processing_steps]
+    best_response = get_best_response(kinds=kinds, dataset=dataset, config=config, split=split)
+    if "error_code" in best_response.response and best_response.response["error_code"] == CACHED_RESPONSE_NOT_FOUND:
+        try_backfill_dataset_then_raise(
+            processing_steps=processing_steps,
+            processing_graph=processing_graph,
+            dataset=dataset,
+            hf_endpoint=hf_endpoint,
+            hf_timeout_seconds=hf_timeout_seconds,
+            hf_token=hf_token,
+            cache_max_days=cache_max_days,
+        )
+    return best_response.response
 
-            if last_result["http_status"] == HTTPStatus.OK:
-                return last_result
-        except DoesNotExist:
-            logging.debug(
-                f"processing_step={processing_step.name} dataset={dataset} "
-                f"config={config} split={split} no entry found"
-            )
-            try:
-                check_in_process(
-                    processing_step=processing_step,
-                    init_processing_steps=init_processing_steps,
-                    dataset=dataset,
-                    config=config,
-                    split=split,
-                    hf_endpoint=hf_endpoint,
-                    hf_token=hf_token,
-                )
-            except (PreviousStepError, DatasetError):
-                raise ResponseNotFoundError("Not found.")
-    if last_result:
-        return last_result
 
-    raise ResponseNotReadyError(
-        "The server is busier than usual and the response is not ready yet. Please retry later."
-    )
+# TODO: remove once full scan is implemented for spawning urls scan
+class OptInOutUrlsCountResponse(TypedDict):
+    urls_columns: List[str]
+    num_opt_in_urls: int
+    num_opt_out_urls: int
+    num_urls: int
+    num_scanned_rows: int
+    has_urls_columns: bool
+    full_scan: Optional[bool]
+
+
+# TODO: remove once full scan is implemented for spawning urls scan
+HARD_CODED_OPT_IN_OUT_URLS = {
+    "laion/laion2B-en": OptInOutUrlsCountResponse(
+        urls_columns=["URL"],
+        num_opt_in_urls=5,
+        num_opt_out_urls=42785281,
+        num_urls=2322161807,
+        num_scanned_rows=0,  # It is unknown but leaving with 0 for now since UI validates non null
+        has_urls_columns=True,
+        full_scan=True,
+    ),
+    "kakaobrain/coyo-700m": OptInOutUrlsCountResponse(
+        urls_columns=["url"],
+        num_opt_in_urls=2,
+        num_opt_out_urls=4691511,
+        num_urls=746972269,
+        num_scanned_rows=0,  # It is unknown but leaving with 0 for now since UI validates non null
+        has_urls_columns=True,
+        full_scan=True,
+    ),
+}
 
 
 class InputTypeValidator(ABC):
@@ -206,10 +224,11 @@ def get_input_type_validator_by_parameters(
 def create_endpoint(
     endpoint_name: str,
     steps_by_input_type: StepsByInputType,
-    init_processing_steps: List[ProcessingStep],
+    processing_graph: ProcessingGraph,
+    cache_max_days: int,
     hf_endpoint: str,
     hf_token: Optional[str] = None,
-    hf_jwt_public_key: Optional[str] = None,
+    hf_jwt_public_keys: Optional[List[str]] = None,
     hf_jwt_algorithm: Optional[str] = None,
     external_auth_url: Optional[str] = None,
     hf_timeout_seconds: Optional[float] = None,
@@ -218,6 +237,7 @@ def create_endpoint(
 ) -> Endpoint:
     async def processing_step_endpoint(request: Request) -> Response:
         context = f"endpoint: {endpoint_name}"
+        revision: Optional[str] = None
         with StepProfiler(method="processing_step_endpoint", step="all", context=context):
             try:
                 with StepProfiler(
@@ -254,32 +274,54 @@ def create_endpoint(
                         dataset,
                         external_auth_url=external_auth_url,
                         request=request,
-                        hf_jwt_public_key=hf_jwt_public_key,
+                        hf_jwt_public_keys=hf_jwt_public_keys,
                         hf_jwt_algorithm=hf_jwt_algorithm,
                         hf_timeout_seconds=hf_timeout_seconds,
                     )
                 # getting result based on processing steps
                 with StepProfiler(method="processing_step_endpoint", step="get cache entry", context=context):
-                    result = get_cache_entry_from_steps(
-                        processing_steps, dataset, config, split, init_processing_steps, hf_endpoint, hf_token
-                    )
+                    # TODO: remove once full scan is implemented for spawning urls scan
+                    if (
+                        endpoint_name == "/opt-in-out-urls"
+                        and validator.input_type == "dataset"
+                        and dataset in HARD_CODED_OPT_IN_OUT_URLS
+                    ):
+                        return get_json_ok_response(
+                            content=HARD_CODED_OPT_IN_OUT_URLS[dataset], max_age=max_age_long, revision=revision
+                        )
 
+                    result = get_cache_entry_from_steps(
+                        processing_steps=processing_steps,
+                        dataset=dataset,
+                        config=config,
+                        split=split,
+                        processing_graph=processing_graph,
+                        hf_endpoint=hf_endpoint,
+                        hf_token=hf_token,
+                        hf_timeout_seconds=hf_timeout_seconds,
+                        cache_max_days=cache_max_days,
+                    )
                 content = result["content"]
                 http_status = result["http_status"]
                 error_code = result["error_code"]
+                revision = result["dataset_git_revision"]
                 if http_status == HTTPStatus.OK:
                     with StepProfiler(method="processing_step_endpoint", step="generate OK response", context=context):
-                        return get_json_ok_response(content=content, max_age=max_age_long)
+                        return get_json_ok_response(content=content, max_age=max_age_long, revision=revision)
 
                 with StepProfiler(method="processing_step_endpoint", step="generate error response", context=context):
                     return get_json_error_response(
-                        content=content, status_code=http_status, max_age=max_age_short, error_code=error_code
+                        content=content,
+                        status_code=http_status,
+                        max_age=max_age_short,
+                        error_code=error_code,
+                        revision=revision,
                     )
             except Exception as e:
-                error = e if isinstance(e, ApiCustomError) else UnexpectedError("Unexpected error.", e)
+                error = e if isinstance(e, ApiError) else UnexpectedApiError("Unexpected error.", e)
                 with StepProfiler(
                     method="processing_step_endpoint", step="generate API error response", context=context
                 ):
-                    return get_json_api_error_response(error=error, max_age=max_age_short)
+                    return get_json_api_error_response(error=error, max_age=max_age_short, revision=revision)
 
     return processing_step_endpoint

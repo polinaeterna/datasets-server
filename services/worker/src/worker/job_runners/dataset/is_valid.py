@@ -1,53 +1,83 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2022 The HuggingFace Authors.
+# Copyright 2023 The HuggingFace Authors.
 
 import logging
-from typing import Any, Mapping, Tuple, TypedDict
+from http import HTTPStatus
+from typing import Tuple
 
 from libcommon.constants import PROCESSING_STEP_DATASET_IS_VALID_VERSION
-from libcommon.simple_cache import SplitFullName, get_validity_by_kind
+from libcommon.exceptions import PreviousStepFormatError
+from libcommon.simple_cache import (
+    CacheEntryDoesNotExistError,
+    get_previous_step_or_raise,
+    get_response,
+)
 
-from worker.job_runner import JobResult, JobRunner
-
-
-class DatasetIsValidResponse(TypedDict):
-    valid: bool
-
-
-SPLIT_KINDS = [
-    "/splits",
-    "/split-names-from-streaming",
-    "/split-names-from-dataset-info",
-]
-FIRST_ROWS_KINDS = ["split-first-rows-from-streaming", "split-first-rows-from-parquet"]
+from worker.dtos import IsValidResponse, JobResult
+from worker.job_runners.dataset.dataset_job_runner import DatasetJobRunner
 
 
-def compute_is_valid_response(dataset: str) -> Tuple[DatasetIsValidResponse, float]:
+def compute_is_valid_response(dataset: str) -> Tuple[IsValidResponse, float]:
     """
     Get the response of /is-valid for one specific dataset on huggingface.co.
 
-    A dataset is valid if:
-    - /splits is valid for at least one of the configs
-    - /first-rows is valid for at least one of the splits
+
+    A dataset is valid if at least one response of any of the artifacts for any of the
+    steps (for viewer and preview) is valid.
+    The deprecated `valid` field is an "or" of the `preview` and `viewer` fields.
 
     Args:
         dataset (`str`):
             A namespace (user or an organization) and a repo name separated
             by a `/`.
     Returns:
-        `DatasetIsValidResponse`: An object with the is_valid_response.
+        `Tuple[IsValidResponse, float]`: The response (viewer, preview, search) and the progress.
     """
-    logging.info(f"get is-valid response for dataset={dataset}")
+    logging.info(f"get is-valid response for {dataset=}")
 
-    validity_by_kind = get_validity_by_kind(dataset=dataset, kinds=SPLIT_KINDS + FIRST_ROWS_KINDS)
-    is_valid = any(validity_by_kind[kind] for kind in SPLIT_KINDS if kind in validity_by_kind) and any(
-        validity_by_kind[kind] for kind in FIRST_ROWS_KINDS if kind in validity_by_kind
+    config_names_response = get_previous_step_or_raise(kinds=["dataset-config-names"], dataset=dataset)
+    content = config_names_response.response["content"]
+    if "config_names" not in content:
+        raise PreviousStepFormatError("Previous step did not return the expected content: 'config_names'.")
+
+    preview = False
+    viewer = False
+    search = False
+    try:
+        total = 0
+        pending = 0
+        for config_item in content["config_names"]:
+            config = config_item["config"]
+            total += 1
+            try:
+                response = get_response(kind="config-is-valid", dataset=dataset, config=config)
+            except CacheEntryDoesNotExistError:
+                logging.debug("No response found in previous step for this dataset: 'config-is-valid'.")
+                pending += 1
+                continue
+            if response["http_status"] != HTTPStatus.OK:
+                logging.debug(f"Previous step gave an error: {response['http_status']}.")
+                continue
+            config_is_valid_content = response["content"]
+            preview = preview or config_is_valid_content["preview"]
+            viewer = viewer or config_is_valid_content["viewer"]
+            search = search or config_is_valid_content["search"]
+    except Exception as e:
+        raise PreviousStepFormatError("Previous step did not return the expected content.", e) from e
+
+    progress = (total - pending) / total if total else 1.0
+
+    return (
+        IsValidResponse(
+            preview=preview,
+            viewer=viewer,
+            search=search,
+        ),
+        progress,
     )
 
-    return (DatasetIsValidResponse({"valid": is_valid}), 1.0)
 
-
-class DatasetIsValidJobRunner(JobRunner):
+class DatasetIsValidJobRunner(DatasetJobRunner):
     @staticmethod
     def get_job_type() -> str:
         return "dataset-is-valid"
@@ -57,12 +87,5 @@ class DatasetIsValidJobRunner(JobRunner):
         return PROCESSING_STEP_DATASET_IS_VALID_VERSION
 
     def compute(self) -> JobResult:
-        if self.dataset is None:
-            raise ValueError("dataset is required")
         response_content, progress = compute_is_valid_response(dataset=self.dataset)
         return JobResult(response_content, progress=progress)
-
-    def get_new_splits(self, content: Mapping[str, Any]) -> set[SplitFullName]:
-        """Get the set of new splits, from the content created by the compute."""
-        return set()
-        # ^ it does not make sense to depend on this step. Not sure what should be returned here.

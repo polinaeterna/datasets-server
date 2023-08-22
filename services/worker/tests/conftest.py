@@ -4,18 +4,29 @@
 from pathlib import Path
 from typing import Iterator
 
-from libcommon.processing_graph import ProcessingStep
+from libcommon.processing_graph import ProcessingGraph, ProcessingStep
 from libcommon.queue import _clean_queue_database
 from libcommon.resources import CacheMongoResource, QueueMongoResource
 from libcommon.simple_cache import _clean_cache_database
-from libcommon.storage import StrPath, init_assets_dir
+from libcommon.storage import (
+    StrPath,
+    init_assets_dir,
+    init_duckdb_index_cache_dir,
+    init_parquet_metadata_dir,
+    init_statistics_cache_dir,
+)
 from pytest import MonkeyPatch, fixture
 
 from worker.config import AppConfig
 from worker.main import WORKER_STATE_FILE_NAME
 from worker.resources import LibrariesResource
 
-from .constants import CI_APP_TOKEN, CI_HUB_ENDPOINT, CI_URL_TEMPLATE, CI_USER_TOKEN
+from .constants import (
+    CI_APP_TOKEN,
+    CI_HUB_ENDPOINT,
+    CI_PARQUET_CONVERTER_APP_TOKEN,
+    CI_URL_TEMPLATE,
+)
 
 
 @fixture
@@ -31,6 +42,11 @@ def modules_cache_directory(tmp_path: Path) -> Path:
 @fixture
 def worker_state_file_path(tmp_path: Path) -> str:
     return str(tmp_path / WORKER_STATE_FILE_NAME)
+
+
+@fixture
+def statistics_cache_directory(app_config: AppConfig) -> StrPath:
+    return init_statistics_cache_dir(app_config.descriptive_statistics.cache_directory)
 
 
 # see https://github.com/pytest-dev/pytest/issues/363#issuecomment-406536200
@@ -58,15 +74,17 @@ def set_env_vars(
     mp.setenv("ASSETS_BASE_URL", "http://localhost/assets")
     mp.setenv("FIRST_ROWS_MAX_NUMBER", "7")
     mp.setenv("PARQUET_AND_INFO_MAX_DATASET_SIZE", "10_000")
+    mp.setenv("DESCRIPTIVE_STATISTICS_MAX_PARQUET_SIZE_BYTES", "10_000")
     mp.setenv("PARQUET_AND_INFO_MAX_EXTERNAL_DATA_FILES", "10")
-    mp.setenv("PARQUET_AND_INFO_COMMITTER_HF_TOKEN", CI_USER_TOKEN)
+    mp.setenv("PARQUET_AND_INFO_COMMITTER_HF_TOKEN", CI_PARQUET_CONVERTER_APP_TOKEN)
+    mp.setenv("DUCKDB_INDEX_COMMITTER_HF_TOKEN", CI_PARQUET_CONVERTER_APP_TOKEN)
     mp.setenv("DATASETS_BASED_HF_DATASETS_CACHE", str(datasets_cache_directory))
     mp.setenv("HF_MODULES_CACHE", str(modules_cache_directory))
     mp.setenv("WORKER_CONTENT_MAX_BYTES", "10_000_000")
     mp.setenv("WORKER_STATE_FILE_PATH", worker_state_file_path)
     mp.setenv("WORKER_HEARTBEAT_INTERVAL_SECONDS", "1")
     mp.setenv("WORKER_KILL_ZOMBIES_INTERVAL_SECONDS", "1")
-    mp.setenv("WORKER_KILL_LONG_JOBS_INTERVAL_SECONDS", "1")
+    mp.setenv("WORKER_KILL_LONG_JOB_INTERVAL_SECONDS", "1")
     mp.setenv("OPT_IN_OUT_URLS_SCAN_SPAWNING_TOKEN", "dummy_spawning_token")
     yield mp
     mp.undo()
@@ -109,19 +127,35 @@ def assets_directory(app_config: AppConfig) -> StrPath:
     return init_assets_dir(app_config.assets.storage_directory)
 
 
-@fixture()
-def test_processing_step() -> ProcessingStep:
-    return ProcessingStep(
-        name="/dummy",
-        input_type="dataset",
-        requires=[],
-        required_by_dataset_viewer=False,
-        ancestors=[],
-        children=[],
-        parents=[],
-        job_runner_version=1,
+@fixture
+def parquet_metadata_directory(app_config: AppConfig) -> StrPath:
+    return init_parquet_metadata_dir(app_config.parquet_metadata.storage_directory)
+
+
+@fixture
+def duckdb_index_cache_directory(app_config: AppConfig) -> StrPath:
+    return init_duckdb_index_cache_dir(app_config.duckdb_index.cache_directory)
+
+
+@fixture
+def test_processing_graph() -> ProcessingGraph:
+    return ProcessingGraph(
+        {
+            "dummy": {"input_type": "dataset"},
+            "dummy2": {"input_type": "dataset"},
+        }
     )
 
 
+@fixture
+def test_processing_step(test_processing_graph: ProcessingGraph) -> ProcessingStep:
+    return test_processing_graph.get_processing_step("dummy")
+
+
+@fixture
+def another_processing_step(test_processing_graph: ProcessingGraph) -> ProcessingStep:
+    return test_processing_graph.get_processing_step("dummy2")
+
+
 # Import fixture modules as plugins
-pytest_plugins = ["tests.fixtures.datasets", "tests.fixtures.files", "tests.fixtures.hub"]
+pytest_plugins = ["tests.fixtures.datasets", "tests.fixtures.files", "tests.fixtures.hub", "tests.fixtures.fsspec"]

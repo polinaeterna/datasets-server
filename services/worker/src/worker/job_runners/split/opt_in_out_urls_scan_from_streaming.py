@@ -1,100 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2022 The HuggingFace Authors.
+# Copyright 2023 The HuggingFace Authors.
 
 import logging
 from asyncio import Semaphore, create_task, run, wait
-from http import HTTPStatus
 from pathlib import Path
-from typing import Any, List, Literal, Mapping, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple
 
 from aiohttp import ClientSession
 from aiolimiter import AsyncLimiter
 from datasets import get_dataset_config_info
 from libcommon.constants import PROCESSING_STEP_SPLIT_OPT_IN_OUT_URLS_SCAN_VERSION
+from libcommon.exceptions import (
+    ExternalServerError,
+    InfoError,
+    MissingSpawningTokenError,
+    PreviousStepFormatError,
+    TooManyColumnsError,
+)
 from libcommon.processing_graph import ProcessingStep
-from libcommon.queue import JobInfo
-from libcommon.simple_cache import SplitFullName
+from libcommon.simple_cache import get_previous_step_or_raise
+from libcommon.utils import JobInfo
 
 from worker.config import AppConfig, OptInOutUrlsScanConfig
-from worker.job_runner import (
-    CompleteJobResult,
-    JobRunnerError,
-    get_previous_step_or_raise,
-)
-from worker.job_runners._datasets_based_job_runner import DatasetsBasedJobRunner
-from worker.utils import (
-    OptInOutUrlsScanResponse,
-    OptUrl,
-    SplitFirstRowsResponse,
-    get_rows_or_raise,
-)
-
-SplitOptInOutUrlsScanJobRunnerErrorCode = Literal[
-    "InfoError",
-    "TooManyColumnsError",
-    "PreviousStepStatusError",
-    "PreviousStepFormatError",
-    "MissingSpawningTokenError",
-    "ExternalServerError",
-]
-
-
-class SplitOptInOutUrlsScanJobRunnerError(JobRunnerError):
-    """Base class for exceptions in this module."""
-
-    def __init__(
-        self,
-        message: str,
-        status_code: HTTPStatus,
-        code: SplitOptInOutUrlsScanJobRunnerErrorCode,
-        cause: Optional[BaseException] = None,
-        disclose_cause: bool = False,
-    ):
-        super().__init__(
-            message=message, status_code=status_code, code=code, cause=cause, disclose_cause=disclose_cause
-        )
-
-
-class InfoError(SplitOptInOutUrlsScanJobRunnerError):
-    """Raised when the info could not be fetched."""
-
-    def __init__(self, message: str, cause: Optional[BaseException] = None):
-        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "InfoError", cause, True)
-
-
-class TooManyColumnsError(SplitOptInOutUrlsScanJobRunnerError):
-    """Raised when the dataset exceeded the max number of columns."""
-
-    def __init__(self, message: str, cause: Optional[BaseException] = None):
-        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "TooManyColumnsError", cause, True)
-
-
-class PreviousStepStatusError(SplitOptInOutUrlsScanJobRunnerError):
-    """Raised when the previous step gave an error. The job should not have been created."""
-
-    def __init__(self, message: str, cause: Optional[BaseException] = None):
-        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "PreviousStepStatusError", cause, False)
-
-
-class PreviousStepFormatError(SplitOptInOutUrlsScanJobRunnerError):
-    """Raised when the content of the previous step has not the expected format."""
-
-    def __init__(self, message: str, cause: Optional[BaseException] = None):
-        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "PreviousStepFormatError", cause, False)
-
-
-class MissingSpawningTokenError(SplitOptInOutUrlsScanJobRunnerError):
-    """Raised when the spawning.ai token is not set."""
-
-    def __init__(self, message: str, cause: Optional[BaseException] = None):
-        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "MissingSpawningTokenError", cause, False)
-
-
-class ExternalServerError(SplitOptInOutUrlsScanJobRunnerError):
-    """Raised when the spawning.ai server is not responding."""
-
-    def __init__(self, message: str, cause: Optional[BaseException] = None):
-        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "ExternalServerError", cause, False)
+from worker.dtos import CompleteJobResult, OptInOutUrlsScanResponse, OptUrl
+from worker.job_runners.split.split_job_runner import SplitJobRunnerWithDatasetsCache
+from worker.utils import get_rows_or_raise
 
 
 async def check_spawning(
@@ -173,28 +103,67 @@ def compute_opt_in_out_urls_scan_response(
     max_requests_per_second: int,
     spawning_url: str,
 ) -> OptInOutUrlsScanResponse:
+    """
+    Get the response of split-opt-in-out-urls-scan cache for a specific split of a dataset from huggingface.co.
+    The response is not used directly in the API but it is an input for config-opt-in-out-urls-scan processing step.
+    Note that only image URLs are scanned, see image_url_columns.py for details about the detection heuristic.
+
+    Args:
+        dataset (`str`):
+            A namespace (user or an organization) and a repo name separated
+            by a `/`.
+        config (`str`):
+            A configuration name.
+        split (`str`):
+            A split name.
+        hf_token (`str` or `None`):
+            An authentication token (See https://huggingface.co/settings/token)
+        rows_max_number (`int`):
+            The maximum number of rows of the response.
+        columns_max_number (`int`):
+            The maximum number of supported columns.
+        urls_number_per_batch (`int`):
+            The number of batch URLs to be sent to spawning service.
+        spawning_token (`str` or `None`):
+            An authentication token to use spawning service (See https://api.spawning.ai/spawning-api)
+        max_concurrent_requests_number (`int`):
+            The maximum number of requests to be processed concurrently.
+        max_requests_per_second (`int`):
+            The maximum number of requests to be processed by second.
+        spawning_url (`str`):
+            Spawgning API URL
+
+    Returns:
+        [`OptInOutUrlsScanResponse`]
+    Raises the following errors:
+        - [`libcommon.simple_cache.CachedArtifactError`]
+          If the previous step gave an error.
+        - [`libcommon.exceptions.PreviousStepFormatError`]
+          If the content of the previous step has not the expected format
+        - [`libcommon.exceptions.InfoError`]
+          If the config info could not be obtained using the datasets library.
+        - [`libcommon.exceptions.TooManyColumnsError`]
+          If the number of columns (features) exceeds the maximum supported number of columns.
+        - [`libcommon.exceptions.StreamingRowsError`]
+          If the split rows could not be obtained using the datasets library in streaming mode.
+        - [`libcommon.exceptions.NormalRowsError`]
+          If the split rows could not be obtained using the datasets library in normal mode.
+    """
     logging.info(f"get opt-in-out-urls-scan for dataset={dataset} config={config} split={split}")
 
-    use_auth_token: Union[bool, str, None] = hf_token if hf_token is not None else False
     if not spawning_token:
         raise MissingSpawningTokenError("OPT_IN_OUT_URLS_SCAN_SPAWNING_TOKEN is not set")
 
-    # get the first rows from previous job
+    # get image url columns from previous job
     upstream_response = get_previous_step_or_raise(
-        kinds=["split-first-rows-from-streaming"], dataset=dataset, config=config, split=split
+        kinds=["split-image-url-columns"],
+        dataset=dataset,
+        config=config,
+        split=split,
     )
     try:
-        first_rows_response = upstream_response.response
-        upstream_response_content = SplitFirstRowsResponse(
-            dataset=dataset,
-            config=config,
-            split=split,
-            features=first_rows_response["content"]["features"],
-            rows=first_rows_response["content"]["rows"],
-        )
-
-        features = upstream_response_content["features"]
-        first_rows = upstream_response_content["rows"]
+        image_url_columns_response = upstream_response.response
+        image_url_columns = image_url_columns_response["content"]["columns"]
     except KeyError as e:
         raise PreviousStepFormatError("Previous step did not return the expected content.", e) from e
 
@@ -203,7 +172,7 @@ def compute_opt_in_out_urls_scan_response(
         info = get_dataset_config_info(
             path=dataset,
             config_name=config,
-            use_auth_token=use_auth_token,
+            token=hf_token,
         )
     except Exception as err:
         raise InfoError(
@@ -211,21 +180,7 @@ def compute_opt_in_out_urls_scan_response(
             cause=err,
         ) from err
 
-    # look for URLs columns using the first rows
-    string_type_dict = {"dtype": "string", "_type": "Value"}
-    string_columns = [feature["name"] for feature in features if feature["type"] == string_type_dict]
-    urls_columns = []
-    for string_column in string_columns:
-        urls_count = sum(
-            1
-            for row in first_rows
-            if isinstance(row["row"].get(string_column), str)
-            and (row["row"][string_column].startswith("https://") or row["row"][string_column].startswith("http://"))
-        )
-        if urls_count and urls_count / len(first_rows) > 0.5:
-            urls_columns.append(string_column)
-
-    if not urls_columns:
+    if not image_url_columns:
         return OptInOutUrlsScanResponse(
             urls_columns=[],
             opt_in_urls=[],
@@ -235,28 +190,30 @@ def compute_opt_in_out_urls_scan_response(
             num_urls=0,
             num_scanned_rows=0,
             has_urls_columns=False,
+            full_scan=None,
         )
 
-    if len(urls_columns) > columns_max_number:
+    if len(image_url_columns) > columns_max_number:
         raise TooManyColumnsError(
-            f"The number of columns ({len(urls_columns)}) exceeds the maximum supported number of columns to scan"
+            f"The number of columns ({len(image_url_columns)}) exceeds the maximum supported number of columns to scan"
             f" ({columns_max_number})."
         )
 
     # get the rows
-    rows = get_rows_or_raise(
+    rows_content = get_rows_or_raise(
         dataset=dataset,
         config=config,
         split=split,
         info=info,
         rows_max_number=rows_max_number,
-        use_auth_token=use_auth_token,
-        column_names=urls_columns,
+        token=hf_token,
+        column_names=image_url_columns,
     )
+    rows = rows_content["rows"]
 
     # get the urls
     num_scanned_rows = len(rows)
-    urls = [row[urls_column] for row in rows for urls_column in urls_columns]
+    urls = [row[urls_column] for row in rows for urls_column in image_url_columns]
 
     # scan the urls
     opt_in_urls_indices, opt_out_urls_indices = run(
@@ -273,23 +230,23 @@ def compute_opt_in_out_urls_scan_response(
     opt_in_urls = [
         OptUrl(
             url=urls[url_idx],
-            row_idx=url_idx // len(urls_columns),
-            column_name=urls_columns[url_idx % len(urls_columns)],
+            row_idx=url_idx // len(image_url_columns),
+            column_name=image_url_columns[url_idx % len(image_url_columns)],
         )
         for url_idx in opt_in_urls_indices
     ]
     opt_out_urls = [
         OptUrl(
             url=urls[url_idx],
-            row_idx=url_idx // len(urls_columns),
-            column_name=urls_columns[url_idx % len(urls_columns)],
+            row_idx=url_idx // len(image_url_columns),
+            column_name=image_url_columns[url_idx % len(image_url_columns)],
         )
         for url_idx in opt_out_urls_indices
     ]
 
     # return scan result
     return OptInOutUrlsScanResponse(
-        urls_columns=urls_columns,
+        urls_columns=image_url_columns,
         opt_in_urls=opt_in_urls,
         opt_out_urls=opt_out_urls,
         num_opt_in_urls=len(opt_in_urls),
@@ -297,15 +254,18 @@ def compute_opt_in_out_urls_scan_response(
         num_urls=len(urls),
         num_scanned_rows=num_scanned_rows,
         has_urls_columns=True,
+        full_scan=rows_content["all_fetched"],
     )
 
 
-class SplitOptInOutUrlsScanJobRunner(DatasetsBasedJobRunner):
+class SplitOptInOutUrlsScanJobRunner(SplitJobRunnerWithDatasetsCache):
     urls_scan_config: OptInOutUrlsScanConfig
 
     @staticmethod
     def get_job_type() -> str:
         return "split-opt-in-out-urls-scan"
+
+    # ^ TODO: Change step name referring to image URLs scan specifically.
 
     @staticmethod
     def get_job_runner_version() -> int:
@@ -327,14 +287,12 @@ class SplitOptInOutUrlsScanJobRunner(DatasetsBasedJobRunner):
         self.urls_scan_config = app_config.urls_scan
 
     def compute(self) -> CompleteJobResult:
-        if self.config is None or self.split is None:
-            raise ValueError("config and split are required")
         return CompleteJobResult(
             compute_opt_in_out_urls_scan_response(
                 dataset=self.dataset,
                 config=self.config,
                 split=self.split,
-                hf_token=self.common_config.hf_token,
+                hf_token=self.app_config.common.hf_token,
                 rows_max_number=self.urls_scan_config.rows_max_number,
                 columns_max_number=self.urls_scan_config.columns_max_number,
                 urls_number_per_batch=self.urls_scan_config.urls_number_per_batch,
@@ -344,9 +302,3 @@ class SplitOptInOutUrlsScanJobRunner(DatasetsBasedJobRunner):
                 spawning_url=self.urls_scan_config.spawning_url,
             )
         )
-
-    def get_new_splits(self, _: Mapping[str, Any]) -> set[SplitFullName]:
-        """Get the set of new splits, from the content created by compute."""
-        if self.config is None or self.split is None:
-            raise ValueError("config and split are required")
-        return {SplitFullName(dataset=self.dataset, config=self.config, split=self.split)}

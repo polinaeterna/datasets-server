@@ -4,16 +4,18 @@
 import logging
 from typing import Optional
 
-from libcommon.dataset import DatasetError, check_support
-from libcommon.processing_graph import ProcessingStep
+from libcommon.dataset import get_dataset_git_revision
+from libcommon.exceptions import CustomError
+from libcommon.processing_graph import InputType
 from libcommon.queue import Queue
+from libcommon.utils import Priority
 from starlette.requests import Request
 from starlette.responses import Response
 
 from admin.authentication import auth_check
 from admin.utils import (
-    AdminCustomError,
     Endpoint,
+    InvalidParameterError,
     MissingRequiredParameterError,
     UnexpectedError,
     are_valid_parameters,
@@ -23,21 +25,24 @@ from admin.utils import (
 
 
 def create_force_refresh_endpoint(
-    processing_step: ProcessingStep,
+    input_type: InputType,
+    job_type: str,
+    difficulty: int,
     hf_endpoint: str,
     hf_token: Optional[str] = None,
     external_auth_url: Optional[str] = None,
     organization: Optional[str] = None,
+    hf_timeout_seconds: Optional[float] = None,
 ) -> Endpoint:
     async def force_refresh_endpoint(request: Request) -> Response:
         try:
             dataset = request.query_params.get("dataset")
             if not are_valid_parameters([dataset]) or not dataset:
                 raise MissingRequiredParameterError("Parameter 'dataset' is required")
-            if processing_step.input_type == "dataset":
+            if input_type == "dataset":
                 config = None
                 split = None
-            elif processing_step.input_type == "config":
+            elif input_type == "config":
                 config = request.query_params.get("config")
                 split = None
                 if not are_valid_parameters([config]):
@@ -47,21 +52,38 @@ def create_force_refresh_endpoint(
                 split = request.query_params.get("split")
                 if not are_valid_parameters([config, split]):
                     raise MissingRequiredParameterError("Parameters 'config' and 'split' are required")
+            try:
+                priority = Priority(request.query_params.get("priority", "low"))
+            except ValueError:
+                raise InvalidParameterError(
+                    f"Parameter 'priority' should be one of {', '.join(prio.value for prio in Priority)}."
+                )
             logging.info(
-                f"/force-refresh{processing_step.job_type}, dataset={dataset}, config={config}, split={split}"
+                f"/force-refresh/{job_type}, dataset={dataset}, config={config}, split={split}, priority={priority}"
             )
 
             # if auth_check fails, it will raise an exception that will be caught below
-            auth_check(external_auth_url=external_auth_url, request=request, organization=organization)
-            check_support(dataset=dataset, hf_endpoint=hf_endpoint, hf_token=hf_token)
-            Queue().upsert_job(
-                job_type=processing_step.job_type, dataset=dataset, config=config, split=split, force=True
+            auth_check(
+                external_auth_url=external_auth_url,
+                request=request,
+                organization=organization,
+                hf_timeout_seconds=hf_timeout_seconds,
+            )
+            revision = get_dataset_git_revision(dataset=dataset, hf_endpoint=hf_endpoint, hf_token=hf_token)
+            Queue().add_job(
+                job_type=job_type,
+                difficulty=difficulty,
+                dataset=dataset,
+                revision=revision,
+                config=config,
+                split=split,
+                priority=priority,
             )
             return get_json_ok_response(
                 {"status": "ok"},
                 max_age=0,
             )
-        except (DatasetError, AdminCustomError) as e:
+        except CustomError as e:
             return get_json_admin_error_response(e, max_age=0)
         except Exception as e:
             return get_json_admin_error_response(UnexpectedError("Unexpected error.", e), max_age=0)

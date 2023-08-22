@@ -2,49 +2,13 @@
 # Copyright 2022 The HuggingFace Authors.
 
 import logging
-from http import HTTPStatus
-from typing import Any, List, Literal, Mapping, Optional, TypedDict
 
 from libcommon.constants import PROCESSING_STEP_CONFIG_PARQUET_VERSION
-from libcommon.simple_cache import SplitFullName
+from libcommon.exceptions import PreviousStepFormatError
+from libcommon.simple_cache import get_previous_step_or_raise
 
-from worker.job_runner import (
-    CompleteJobResult,
-    JobRunner,
-    JobRunnerError,
-    ParameterMissingError,
-    get_previous_step_or_raise,
-)
-from worker.job_runners.config.parquet_and_info import ParquetFileItem
-
-ConfigParquetJobRunnerErrorCode = Literal["PreviousStepFormatError"]
-
-
-class ConfigParquetResponse(TypedDict):
-    parquet_files: List[ParquetFileItem]
-
-
-class ConfigParquetJobRunnerError(JobRunnerError):
-    """Base class for exceptions in this module."""
-
-    def __init__(
-        self,
-        message: str,
-        status_code: HTTPStatus,
-        code: ConfigParquetJobRunnerErrorCode,
-        cause: Optional[BaseException] = None,
-        disclose_cause: bool = False,
-    ):
-        super().__init__(
-            message=message, status_code=status_code, code=code, cause=cause, disclose_cause=disclose_cause
-        )
-
-
-class PreviousStepFormatError(ConfigParquetJobRunnerError):
-    """Raised when the content of the previous step has not the expected format."""
-
-    def __init__(self, message: str, cause: Optional[BaseException] = None):
-        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "PreviousStepFormatError", cause, False)
+from worker.dtos import CompleteJobResult, ConfigParquetResponse
+from worker.job_runners.config.config_job_runner import ConfigJobRunner
 
 
 def compute_parquet_response(dataset: str, config: str) -> ConfigParquetResponse:
@@ -58,13 +22,11 @@ def compute_parquet_response(dataset: str, config: str) -> ConfigParquetResponse
             A configuration name.
     Returns:
         `ConfigParquetResponse`: An object with the parquet_response (list of parquet files).
-    <Tip>
     Raises the following errors:
-        - [`~job_runner.PreviousStepError`]
-            If the previous step gave an error.
-        - [`~job_runners.parquet.PreviousStepFormatError`]
-            If the content of the previous step has not the expected format
-    </Tip>
+        - [`libcommon.simple_cache.CachedArtifactError`]
+          If the previous step gave an error.
+        - [`libcommon.exceptions.PreviousStepFormatError`]
+          If the content of the previous step has not the expected format
     """
     logging.info(f"get parquet files for dataset={dataset}, config={config}")
 
@@ -73,14 +35,25 @@ def compute_parquet_response(dataset: str, config: str) -> ConfigParquetResponse
         kinds=[previous_step], dataset=dataset, config=config
     )
     content = config_parquet_and_info_best_response.response["content"]
-    if "parquet_files" not in content:
-        raise PreviousStepFormatError("Previous step did not return the expected content: 'parquet_files'.")
 
-    parquet_files = [parquet_file for parquet_file in content["parquet_files"] if parquet_file.get("config") == config]
-    return ConfigParquetResponse(parquet_files=parquet_files)
+    try:
+        parquet_files = [
+            parquet_file for parquet_file in content["parquet_files"] if parquet_file.get("config") == config
+        ]
+        # sort by filename, which ensures the shards are in order: 00000, 00001, 00002, ...
+        parquet_files.sort(key=lambda x: (x["split"], x["filename"]))
+        if "features" in content["dataset_info"] and isinstance(content["dataset_info"]["features"], dict):
+            features = content["dataset_info"]["features"]
+        else:
+            # (July 23) we can remove this later and raise an error instead (can be None for backward compatibility)
+            features = None
+        partial = content["partial"]
+    except KeyError as e:
+        raise PreviousStepFormatError("Previous step did not return the expected content: 'parquet_files'.", e) from e
+    return ConfigParquetResponse(parquet_files=parquet_files, features=features, partial=partial)
 
 
-class ConfigParquetJobRunner(JobRunner):
+class ConfigParquetJobRunner(ConfigJobRunner):
     @staticmethod
     def get_job_type() -> str:
         return "config-parquet"
@@ -90,15 +63,4 @@ class ConfigParquetJobRunner(JobRunner):
         return PROCESSING_STEP_CONFIG_PARQUET_VERSION
 
     def compute(self) -> CompleteJobResult:
-        if self.dataset is None:
-            raise ParameterMissingError("'dataset' parameter is required")
-        if self.config is None:
-            raise ParameterMissingError("'config' parameter is required")
         return CompleteJobResult(compute_parquet_response(dataset=self.dataset, config=self.config))
-
-    def get_new_splits(self, content: Mapping[str, Any]) -> set[SplitFullName]:
-        """Get the set of new splits, from the content created by the compute."""
-        return {
-            SplitFullName(dataset=self.dataset, config=self.config, split=parquet_file["split"])
-            for parquet_file in content["parquet_files"]
-        }

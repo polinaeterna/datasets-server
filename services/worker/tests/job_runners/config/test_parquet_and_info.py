@@ -2,63 +2,78 @@
 # Copyright 2022 The HuggingFace Authors.
 
 import io
+import os
+from contextlib import contextmanager
+from dataclasses import replace
 from fnmatch import fnmatch
 from http import HTTPStatus
-from typing import Any, Callable, Iterator, List, Optional
+from multiprocessing import Pool
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, TypedDict
+from unittest.mock import patch
 
 import datasets.builder
+import datasets.config
 import datasets.info
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 import requests
-from datasets import Audio, Features, Image, Value
-from huggingface_hub.hf_api import HfApi
-from libcommon.exceptions import CustomError
-from libcommon.processing_graph import ProcessingStep
-from libcommon.queue import Priority
+from datasets import Audio, Features, Image, Value, load_dataset_builder
+from datasets.packaged_modules.generator.generator import (
+    Generator as ParametrizedGeneratorBasedBuilder,
+)
+from datasets.utils.py_utils import asdict
+from huggingface_hub.hf_api import CommitOperationAdd, HfApi
+from libcommon.dataset import get_dataset_info_for_supported_datasets
+from libcommon.exceptions import (
+    CustomError,
+    DatasetInBlockListError,
+    DatasetManualDownloadError,
+)
+from libcommon.processing_graph import ProcessingGraph, ProcessingStep
+from libcommon.queue import Queue
 from libcommon.resources import CacheMongoResource, QueueMongoResource
-from libcommon.simple_cache import DoesNotExist, get_response, upsert_response
+from libcommon.simple_cache import CachedArtifactError, upsert_response
+from libcommon.utils import JobInfo, JobParams, Priority
 
 from worker.config import AppConfig
+from worker.dtos import CompleteJobResult
+from worker.job_manager import JobManager
 from worker.job_runners.config.parquet_and_info import (
     ConfigParquetAndInfoJobRunner,
-    DatasetInBlockListError,
-    DatasetTooBigFromDatasetsError,
-    DatasetTooBigFromHubError,
-    DatasetWithTooBigExternalFilesError,
-    DatasetWithTooManyExternalFilesError,
-    get_dataset_info_or_raise,
-    get_writer_batch_size,
+    ParquetFileValidator,
+    TooBigRowGroupsError,
+    _is_too_big_from_datasets,
+    _is_too_big_from_external_data_files,
+    _is_too_big_from_hub,
+    create_commits,
+    fill_builder_info,
+    get_delete_operations,
+    get_writer_batch_size_from_info,
+    get_writer_batch_size_from_row_group_size,
+    limit_parquet_writes,
+    list_generated_parquet_files,
     parse_repo_filename,
     raise_if_blocked,
-    raise_if_not_supported,
-    raise_if_too_big_from_datasets,
-    raise_if_too_big_from_external_data_files,
-    raise_if_too_big_from_hub,
+    raise_if_requires_manual_download,
+    stream_convert_to_parquet,
 )
+from worker.job_runners.dataset.config_names import DatasetConfigNamesJobRunner
 from worker.resources import LibrariesResource
 
 from ...constants import CI_HUB_ENDPOINT, CI_USER_TOKEN
-from ...fixtures.hub import HubDatasets
+from ...fixtures.hub import HubDatasetTest
 
 
-# see https://github.com/pytest-dev/pytest/issues/363#issuecomment-406536200
-@pytest.fixture(scope="module", autouse=True)
-def set_supported_datasets(hub_datasets: HubDatasets) -> Iterator[pytest.MonkeyPatch]:
-    mp = pytest.MonkeyPatch()
-    mp.setenv(
-        "PARQUET_AND_INFO_BLOCKED_DATASETS",
-        ",".join(value["name"] for value in hub_datasets.values() if "jsonl" in value["name"]),
-    )
-    mp.setenv(
-        "PARQUET_AND_INFO_SUPPORTED_DATASETS",
-        ",".join(value["name"] for value in hub_datasets.values() if "big" not in value["name"]),
-    )
-    yield mp
-    mp.undo()
+@contextmanager
+def blocked(app_config: AppConfig, repo_id: str) -> Iterator[None]:
+    app_config.parquet_and_info.blocked_datasets.append(repo_id)
+    yield
+    app_config.parquet_and_info.blocked_datasets.remove(repo_id)
 
 
-GetJobRunner = Callable[[str, str, AppConfig, bool], ConfigParquetAndInfoJobRunner]
+GetJobRunner = Callable[[str, str, AppConfig], ConfigParquetAndInfoJobRunner]
 
 
 @pytest.fixture
@@ -71,29 +86,33 @@ def get_job_runner(
         dataset: str,
         config: str,
         app_config: AppConfig,
-        force: bool = False,
     ) -> ConfigParquetAndInfoJobRunner:
+        processing_step_name = ConfigParquetAndInfoJobRunner.get_job_type()
+        processing_graph = ProcessingGraph(
+            {
+                "dataset-level": {"input_type": "dataset"},
+                processing_step_name: {
+                    "input_type": "dataset",
+                    "job_runner_version": ConfigParquetAndInfoJobRunner.get_job_runner_version(),
+                    "triggered_by": "dataset-level",
+                },
+            }
+        )
         return ConfigParquetAndInfoJobRunner(
             job_info={
                 "type": ConfigParquetAndInfoJobRunner.get_job_type(),
-                "dataset": dataset,
-                "config": config,
-                "split": None,
+                "params": {
+                    "dataset": dataset,
+                    "revision": "revision",
+                    "config": config,
+                    "split": None,
+                },
                 "job_id": "job_id",
-                "force": force,
                 "priority": Priority.NORMAL,
+                "difficulty": 50,
             },
             app_config=app_config,
-            processing_step=ProcessingStep(
-                name=ConfigParquetAndInfoJobRunner.get_job_type(),
-                input_type="config",
-                requires=[],
-                required_by_dataset_viewer=False,
-                ancestors=[],
-                children=[],
-                parents=[],
-                job_runner_version=ConfigParquetAndInfoJobRunner.get_job_runner_version(),
-            ),
+            processing_step=processing_graph.get_processing_step(processing_step_name),
             hf_datasets_cache=libraries_resource.hf_datasets_cache,
         )
 
@@ -102,7 +121,7 @@ def get_job_runner(
 
 def assert_content_is_equal(content: Any, expected: Any) -> None:
     print(content)
-    assert set(content) == {"parquet_files", "dataset_info"}, content
+    assert set(content) == {"parquet_files", "dataset_info", "partial"}, content
     assert content["parquet_files"] == expected["parquet_files"], content
     assert len(content["dataset_info"]) == len(expected["dataset_info"]), content
     content_value = content["dataset_info"]
@@ -111,35 +130,29 @@ def assert_content_is_equal(content: Any, expected: Any) -> None:
     for key in content_value.keys():
         if key != "download_checksums":
             assert content_value[key] == expected_value[key], content
-    assert len(content_value["download_checksums"]) == 1, content
-    content_checksum = list(content_value["download_checksums"].values())[0]
-    expected_checksum = list(expected_value["download_checksums"].values())[0]
-    assert content_checksum == expected_checksum, content
+    assert content["partial"] == expected["partial"], content
 
 
 def test_compute(
     app_config: AppConfig,
     get_job_runner: GetJobRunner,
-    hub_datasets: HubDatasets,
+    hub_responses_public: HubDatasetTest,
 ) -> None:
-    dataset = hub_datasets["public"]["name"]
-    config = hub_datasets["public"]["config_names_response"]["config_names"][0]["config"]
+    dataset = hub_responses_public["name"]
+    config = hub_responses_public["config_names_response"]["config_names"][0]["config"]
     upsert_response(
-        "/config-names",
+        "dataset-config-names",
         dataset=dataset,
         http_status=HTTPStatus.OK,
-        content=hub_datasets["public"]["config_names_response"],
+        content=hub_responses_public["config_names_response"],
     )
-    job_runner = get_job_runner(dataset, config, app_config, False)
-    assert job_runner.process()
-    cached_response = get_response(kind=job_runner.processing_step.cache_kind, dataset=dataset, config=config)
-    assert cached_response["http_status"] == HTTPStatus.OK
-    assert cached_response["error_code"] is None
-    assert cached_response["job_runner_version"] == job_runner.get_job_runner_version()
-    assert cached_response["dataset_git_revision"] is not None
-    content = cached_response["content"]
+    job_runner = get_job_runner(dataset, config, app_config)
+    response = job_runner.compute()
+    assert response
+    content = response.content
+    assert content
     assert len(content["parquet_files"]) == 1
-    assert_content_is_equal(content, hub_datasets["public"]["parquet_and_info_response"])
+    assert_content_is_equal(content, hub_responses_public["parquet_and_info_response"])
 
 
 def test_compute_legacy_configs(
@@ -147,10 +160,12 @@ def test_compute_legacy_configs(
     get_job_runner: GetJobRunner,
     hub_public_legacy_configs: str,
 ) -> None:
+    app_config = replace(app_config, parquet_and_info=replace(app_config.parquet_and_info, max_dataset_size=20_000))
+
     dataset_name = hub_public_legacy_configs
     original_configs = {"first", "second"}
     upsert_response(
-        kind="/config-names",
+        kind="dataset-config-names",
         dataset=hub_public_legacy_configs,
         http_status=HTTPStatus.OK,
         content={
@@ -162,8 +177,8 @@ def test_compute_legacy_configs(
     )
     # first compute and push parquet files for each config for dataset with script with two configs
     for config in original_configs:
-        job_runner = get_job_runner(dataset_name, config, app_config, False)
-        assert job_runner.process()
+        job_runner = get_job_runner(dataset_name, config, app_config)
+        assert job_runner.compute()
     hf_api = HfApi(endpoint=CI_HUB_ENDPOINT, token=CI_USER_TOKEN)
     dataset_info = hf_api.dataset_info(
         repo_id=hub_public_legacy_configs, revision=app_config.parquet_and_info.target_revision, files_metadata=False
@@ -173,7 +188,7 @@ def test_compute_legacy_configs(
     # (no files from 'main')
     assert ".gitattributes" in repo_files
     assert all(
-        fnmatch(file, "first/*.parquet") or fnmatch(file, "second/*.parquet")
+        fnmatch(file, "first/*/*.parquet") or fnmatch(file, "second/*/*.parquet")
         for file in repo_files.difference({".gitattributes"})
     )
     orig_repo_configs = {f.rfilename.split("/")[0] for f in dataset_info.siblings if f.rfilename.endswith(".parquet")}
@@ -182,7 +197,7 @@ def test_compute_legacy_configs(
     assert orig_repo_configs == original_configs
     # then change the set of dataset configs (remove "second")
     upsert_response(
-        kind="/config-names",
+        kind="dataset-config-names",
         dataset=hub_public_legacy_configs,
         http_status=HTTPStatus.OK,
         content={
@@ -191,8 +206,8 @@ def test_compute_legacy_configs(
             ],
         },
     )
-    job_runner = get_job_runner(dataset_name, "first", app_config, False)
-    assert job_runner.process()
+    job_runner = get_job_runner(dataset_name, "first", app_config)
+    assert job_runner.compute()
     dataset_info = hf_api.dataset_info(
         repo_id=hub_public_legacy_configs, revision=app_config.parquet_and_info.target_revision, files_metadata=False
     )
@@ -200,20 +215,12 @@ def test_compute_legacy_configs(
     # assert that legacy config is removed from the repo
     # and there are only files for config that was just pushed and .gitattributes
     assert ".gitattributes" in updated_repo_files
-    assert all(fnmatch(file, "first/*") for file in updated_repo_files.difference({".gitattributes"}))
+    assert all(fnmatch(file, "first/*/*.parquet") for file in updated_repo_files.difference({".gitattributes"}))
     updated_repo_configs = {
         f.rfilename.split("/")[0] for f in dataset_info.siblings if f.rfilename.endswith(".parquet")
     }
     assert len(updated_repo_configs) == 1
     assert updated_repo_configs == {"first"}
-
-
-def test_doesnotexist(app_config: AppConfig, get_job_runner: GetJobRunner) -> None:
-    dataset, config = "doesnotexist", "nonexisting"
-    job_runner = get_job_runner(dataset, config, app_config, False)
-    assert not job_runner.process()
-    with pytest.raises(DoesNotExist):
-        get_response(kind=job_runner.processing_step.cache_kind, dataset=dataset, config=config)
 
 
 @pytest.mark.parametrize(
@@ -233,102 +240,92 @@ def test_raise_if_blocked(dataset: str, blocked: List[str], raises: bool) -> Non
         raise_if_blocked(dataset=dataset, blocked_datasets=blocked)
 
 
+def test_raise_if_requires_manual_download(hub_public_manual_download: str, app_config: AppConfig) -> None:
+    builder = load_dataset_builder(hub_public_manual_download)
+    with pytest.raises(DatasetManualDownloadError):
+        raise_if_requires_manual_download(
+            builder=builder,
+            hf_endpoint=app_config.common.hf_endpoint,
+            hf_token=app_config.common.hf_token,
+        )
+
+
 @pytest.mark.parametrize(
-    "name,raises",
+    "name,expected",
     [("public", False), ("big", True)],
 )
-def test_raise_if_too_big_from_hub(
-    hub_datasets: HubDatasets,
+def test__is_too_big_from_hub(
+    hub_public_csv: str,
+    hub_public_big: str,
     name: str,
-    raises: bool,
+    expected: bool,
     app_config: AppConfig,
 ) -> None:
-    dataset = hub_datasets[name]["name"]
-    dataset_info = get_dataset_info_or_raise(
+    dataset = hub_public_csv if name == "public" else hub_public_big
+    dataset_info = get_dataset_info_for_supported_datasets(
         dataset=dataset,
         hf_endpoint=app_config.common.hf_endpoint,
         hf_token=app_config.common.hf_token,
         revision="main",
+        files_metadata=True,
     )
-    if raises:
-        with pytest.raises(DatasetTooBigFromHubError):
-            raise_if_too_big_from_hub(
-                dataset_info=dataset_info, max_dataset_size=app_config.parquet_and_info.max_dataset_size
-            )
-    else:
-        raise_if_too_big_from_hub(
-            dataset_info=dataset_info, max_dataset_size=app_config.parquet_and_info.max_dataset_size
-        )
+    assert (
+        _is_too_big_from_hub(dataset_info=dataset_info, max_dataset_size=app_config.parquet_and_info.max_dataset_size)
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
-    "name,raises",
+    "name,expected",
     [("public", False), ("big", True)],
 )
-def test_raise_if_too_big_from_datasets(
-    hub_datasets: HubDatasets,
+def test__is_too_big_from_datasets(
+    hub_public_csv: str,
+    hub_public_big: str,
     name: str,
-    raises: bool,
+    expected: bool,
     app_config: AppConfig,
 ) -> None:
-    dataset = hub_datasets[name]["name"]
-    config = hub_datasets[name]["config_names_response"]["config_names"][0]["config"]
-    if raises:
-        with pytest.raises(DatasetTooBigFromDatasetsError):
-            raise_if_too_big_from_datasets(
-                dataset=dataset,
-                config=config,
-                hf_endpoint=app_config.common.hf_endpoint,
-                hf_token=app_config.common.hf_token,
-                revision="main",
-                max_dataset_size=app_config.parquet_and_info.max_dataset_size,
-            )
-    else:
-        raise_if_too_big_from_datasets(
-            dataset=dataset,
-            config=config,
-            hf_endpoint=app_config.common.hf_endpoint,
-            hf_token=app_config.common.hf_token,
-            revision="main",
+    dataset = hub_public_csv if name == "public" else hub_public_big
+    builder = load_dataset_builder(dataset)
+    assert (
+        _is_too_big_from_datasets(
+            info=builder.info,
             max_dataset_size=app_config.parquet_and_info.max_dataset_size,
         )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
-    "max_dataset_size,max_external_data_files,raises",
+    "max_dataset_size,max_external_data_files,expected",
     [
         (None, None, False),
         (10, None, True),
     ],
 )
-def test_raise_if_too_big_external_files(
+def test__is_too_big_external_files(
     external_files_dataset_builder: "datasets.builder.DatasetBuilder",
-    raises: bool,
+    expected: bool,
     max_dataset_size: Optional[int],
     max_external_data_files: Optional[int],
     app_config: AppConfig,
 ) -> None:
     max_dataset_size = max_dataset_size or app_config.parquet_and_info.max_dataset_size
     max_external_data_files = max_external_data_files or app_config.parquet_and_info.max_external_data_files
-    if raises:
-        with pytest.raises(DatasetWithTooBigExternalFilesError):
-            raise_if_too_big_from_external_data_files(
-                builder=external_files_dataset_builder,
-                hf_token=app_config.common.hf_token,
-                max_dataset_size=max_dataset_size,
-                max_external_data_files=max_external_data_files,
-            )
-    else:
-        raise_if_too_big_from_external_data_files(
+    assert (
+        _is_too_big_from_external_data_files(
             builder=external_files_dataset_builder,
             hf_token=app_config.common.hf_token,
             max_dataset_size=max_dataset_size,
             max_external_data_files=max_external_data_files,
         )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
-    "max_dataset_size,max_external_data_files,raises",
+    "max_dataset_size,max_external_data_files,expected",
     [
         (None, None, False),
         (None, 1, True),
@@ -336,155 +333,120 @@ def test_raise_if_too_big_external_files(
 )
 def test_raise_if_too_many_external_files(
     external_files_dataset_builder: "datasets.builder.DatasetBuilder",
-    raises: bool,
+    expected: bool,
     max_dataset_size: Optional[int],
     max_external_data_files: Optional[int],
     app_config: AppConfig,
 ) -> None:
     max_dataset_size = max_dataset_size or app_config.parquet_and_info.max_dataset_size
     max_external_data_files = max_external_data_files or app_config.parquet_and_info.max_external_data_files
-    if raises:
-        with pytest.raises(DatasetWithTooManyExternalFilesError):
-            raise_if_too_big_from_external_data_files(
-                builder=external_files_dataset_builder,
-                hf_token=app_config.common.hf_token,
-                max_dataset_size=max_dataset_size,
-                max_external_data_files=max_external_data_files,
-            )
-    else:
-        raise_if_too_big_from_external_data_files(
+    assert (
+        _is_too_big_from_external_data_files(
             builder=external_files_dataset_builder,
             hf_token=app_config.common.hf_token,
             max_dataset_size=max_dataset_size,
             max_external_data_files=max_external_data_files,
         )
+        == expected
+    )
 
 
-@pytest.mark.parametrize(
-    "in_list,raises",
-    [
-        (True, False),
-        (False, True),
-    ],
-)
-def test_raise_if_not_supported(
-    hub_datasets: HubDatasets,
-    app_config: AppConfig,
-    in_list: bool,
-    raises: bool,
-) -> None:
-    dataset = hub_datasets["big"]["name"]
-    config = hub_datasets["big"]["config_names_response"]["config_names"][0]["config"]
-    if raises:
-        with pytest.raises(DatasetTooBigFromDatasetsError):
-            raise_if_not_supported(
-                dataset=dataset,
-                config=config,
-                hf_endpoint=app_config.common.hf_endpoint,
-                hf_token=app_config.common.hf_token,
-                committer_hf_token=app_config.parquet_and_info.committer_hf_token,
-                revision="main",
-                max_dataset_size=app_config.parquet_and_info.max_dataset_size,
-                supported_datasets=[dataset] if in_list else ["another_dataset"],
-                blocked_datasets=[],
-            )
-    else:
-        raise_if_not_supported(
-            dataset=dataset,
-            config=config,
-            hf_endpoint=app_config.common.hf_endpoint,
-            hf_token=app_config.common.hf_token,
-            committer_hf_token=app_config.parquet_and_info.committer_hf_token,
-            revision="main",
-            max_dataset_size=app_config.parquet_and_info.max_dataset_size,
-            supported_datasets=[dataset] if in_list else ["another_dataset"],
-            blocked_datasets=[],
-        )
-
-
-def test_not_supported_if_big(
+def test_supported_if_big_parquet(
     app_config: AppConfig,
     get_job_runner: GetJobRunner,
-    hub_datasets: HubDatasets,
+    hub_responses_big: HubDatasetTest,
 ) -> None:
     # Not in the list of supported datasets and bigger than the maximum size
+    # but still supported since it's made of parquet files
     # dataset = hub_public_big
-    dataset = hub_datasets["big"]["name"]
-    config = hub_datasets["big"]["config_names_response"]["config_names"][0]["config"]
+    dataset = hub_responses_big["name"]
+    config = hub_responses_big["config_names_response"]["config_names"][0]["config"]
     upsert_response(
-        kind="/config-names",
+        kind="dataset-config-names",
         dataset=dataset,
         http_status=HTTPStatus.OK,
-        content=hub_datasets["big"]["config_names_response"],
+        content=hub_responses_big["config_names_response"],
     )
-    job_runner = get_job_runner(dataset, config, app_config, False)
-    assert not job_runner.process()
-    cached_response = get_response(kind=job_runner.processing_step.cache_kind, dataset=dataset, config=config)
-    assert cached_response["http_status"] == HTTPStatus.NOT_IMPLEMENTED
-    assert cached_response["error_code"] == "DatasetTooBigFromDatasetsError"
+    job_runner = get_job_runner(dataset, config, app_config)
+    response = job_runner.compute()
+    assert response
+    content = response.content
+    assert content
+    assert len(content["parquet_files"]) == 1
+    assert_content_is_equal(content, hub_responses_big["parquet_and_info_response"])
+
+
+def test_partially_converted_if_big_non_parquet(
+    app_config: AppConfig,
+    get_job_runner: GetJobRunner,
+    hub_responses_big_csv: HubDatasetTest,
+) -> None:
+    # Not in the list of supported datasets and bigger than the maximum size
+    # dataset = hub_public_big_csv
+    dataset = hub_responses_big_csv["name"]
+    config = hub_responses_big_csv["config_names_response"]["config_names"][0]["config"]
+    upsert_response(
+        kind="dataset-config-names",
+        dataset=dataset,
+        http_status=HTTPStatus.OK,
+        content=hub_responses_big_csv["config_names_response"],
+    )
+    job_runner = get_job_runner(dataset, config, app_config)
+    from datasets.packaged_modules.csv.csv import CsvConfig
+
+    # Set a small chunk size to yield more than one Arrow Table in _generate_tables
+    # to be able to stop the generation mid-way.
+    with patch.object(CsvConfig, "pd_read_csv_kwargs", {"chunksize": 10}):
+        response = job_runner.compute()
+    assert response
+    content = response.content
+    assert content
+    assert len(content["parquet_files"]) == 1
+    assert_content_is_equal(content, hub_responses_big_csv["parquet_and_info_response"])
+    # dataset is partially generated
+    assert content["parquet_files"][0]["size"] < app_config.parquet_and_info.max_dataset_size
+    assert content["parquet_files"][0]["url"].endswith("/partial-train/0000.parquet")
 
 
 def test_supported_if_gated(
     app_config: AppConfig,
     get_job_runner: GetJobRunner,
-    hub_datasets: HubDatasets,
+    hub_responses_gated: HubDatasetTest,
 ) -> None:
     # Access must be granted
-    dataset = hub_datasets["gated"]["name"]
-    config = hub_datasets["gated"]["config_names_response"]["config_names"][0]["config"]
+    dataset = hub_responses_gated["name"]
+    config = hub_responses_gated["config_names_response"]["config_names"][0]["config"]
     upsert_response(
-        "/config-names",
+        "dataset-config-names",
         dataset=dataset,
         http_status=HTTPStatus.OK,
-        content=hub_datasets["gated"]["config_names_response"],
+        content=hub_responses_gated["config_names_response"],
     )
-    job_runner = get_job_runner(dataset, config, app_config, False)
-    assert job_runner.process()
-    cached_response = get_response(kind=job_runner.processing_step.cache_kind, dataset=dataset, config=config)
-    assert cached_response["http_status"] == HTTPStatus.OK
-    assert cached_response["error_code"] is None
-
-
-def test_not_supported_if_gated_with_extra_fields(
-    app_config: AppConfig,
-    get_job_runner: GetJobRunner,
-    hub_datasets: HubDatasets,
-) -> None:
-    # Access request should fail because extra fields in gated datasets are not supported
-    dataset = hub_datasets["gated_extra_fields"]["name"]
-    config = hub_datasets["gated_extra_fields"]["config_names_response"]["config_names"][0]["config"]
-    upsert_response(
-        kind="/config-names",
-        dataset=dataset,
-        http_status=HTTPStatus.OK,
-        content=hub_datasets["gated_extra_fields"]["config_names_response"],
-    )
-    job_runner = get_job_runner(dataset, config, app_config, False)
-    assert not job_runner.process()
-    cached_response = get_response(kind=job_runner.processing_step.cache_kind, dataset=dataset, config=config)
-    assert cached_response["http_status"] == HTTPStatus.NOT_FOUND
-    assert cached_response["error_code"] == "GatedExtraFieldsError"
+    job_runner = get_job_runner(dataset, config, app_config)
+    response = job_runner.compute()
+    assert response
+    assert response.content
 
 
 def test_blocked(
     app_config: AppConfig,
     get_job_runner: GetJobRunner,
-    hub_datasets: HubDatasets,
+    hub_reponses_jsonl: HubDatasetTest,
 ) -> None:
     # In the list of blocked datasets
-    dataset = hub_datasets["jsonl"]["name"]
-    config = hub_datasets["jsonl"]["config_names_response"]["config_names"][0]["config"]
-    upsert_response(
-        kind="/config-names",
-        dataset=dataset,
-        http_status=HTTPStatus.OK,
-        content=hub_datasets["jsonl"]["config_names_response"],
-    )
-    job_runner = get_job_runner(dataset, config, app_config, False)
-    assert not job_runner.process()
-    cached_response = get_response(kind=job_runner.processing_step.cache_kind, dataset=dataset, config=config)
-    assert cached_response["http_status"] == HTTPStatus.NOT_IMPLEMENTED
-    assert cached_response["error_code"] == "DatasetInBlockListError"
+    with blocked(app_config, repo_id=hub_reponses_jsonl["name"]):
+        dataset = hub_reponses_jsonl["name"]
+        config = hub_reponses_jsonl["config_names_response"]["config_names"][0]["config"]
+        upsert_response(
+            kind="dataset-config-names",
+            dataset=dataset,
+            http_status=HTTPStatus.OK,
+            content=hub_reponses_jsonl["config_names_response"],
+        )
+        job_runner = get_job_runner(dataset, config, app_config)
+        with pytest.raises(CustomError) as e:
+            job_runner.compute()
+        assert e.typename == "DatasetInBlockListError"
 
 
 @pytest.mark.parametrize(
@@ -492,22 +454,25 @@ def test_blocked(
     ["public", "audio", "gated"],
 )
 def test_compute_splits_response_simple_csv_ok(
-    hub_datasets: HubDatasets,
+    hub_responses_public: HubDatasetTest,
+    hub_responses_audio: HubDatasetTest,
+    hub_responses_gated: HubDatasetTest,
     get_job_runner: GetJobRunner,
     name: str,
     app_config: AppConfig,
     data_df: pd.DataFrame,
 ) -> None:
+    hub_datasets = {"public": hub_responses_public, "audio": hub_responses_audio, "gated": hub_responses_gated}
     dataset = hub_datasets[name]["name"]
     config = hub_datasets[name]["config_names_response"]["config_names"][0]["config"]
     upsert_response(
-        "/config-names",
+        "dataset-config-names",
         dataset=dataset,
         http_status=HTTPStatus.OK,
         content=hub_datasets[name]["config_names_response"],
     )
     expected_parquet_and_info_response = hub_datasets[name]["parquet_and_info_response"]
-    job_runner = get_job_runner(dataset, config, app_config, False)
+    job_runner = get_job_runner(dataset, config, app_config)
     result = job_runner.compute().content
     assert_content_is_equal(result, expected_parquet_and_info_response)
 
@@ -532,24 +497,27 @@ def test_compute_splits_response_simple_csv_ok(
 @pytest.mark.parametrize(
     "name,error_code,cause",
     [
-        ("does_not_exist", "ParameterMissingError", None),
-        ("gated_extra_fields", "GatedExtraFieldsError", "HTTPError"),
         ("private", "DatasetNotFoundError", None),
-        ("public", "CachedResponseNotFound", None),  # no cache for /config-names -> CachedResponseNotFound
     ],
 )
 def test_compute_splits_response_simple_csv_error(
-    hub_datasets: HubDatasets,
+    hub_responses_private: HubDatasetTest,
     get_job_runner: GetJobRunner,
     name: str,
     error_code: str,
     cause: str,
     app_config: AppConfig,
 ) -> None:
-    dataset = hub_datasets[name]["name"]
-    config_names_response = hub_datasets[name]["config_names_response"]
+    dataset = hub_responses_private["name"]
+    config_names_response = hub_responses_private["config_names_response"]
     config = config_names_response["config_names"][0]["config"] if config_names_response else None
-    job_runner = get_job_runner(dataset, config, app_config, False)
+    upsert_response(
+        "dataset-config-names",
+        dataset=dataset,
+        http_status=HTTPStatus.OK,
+        content=hub_responses_private["config_names_response"],
+    )
+    job_runner = get_job_runner(dataset, config, app_config)
     with pytest.raises(CustomError) as exc_info:
         job_runner.compute()
     assert exc_info.value.code == error_code
@@ -565,9 +533,31 @@ def test_compute_splits_response_simple_csv_error(
 
 
 @pytest.mark.parametrize(
-    "upstream_status,upstream_content,error_code",
+    "name,error_code,cause",
     [
-        (HTTPStatus.NOT_FOUND, {"error": "error"}, "PreviousStepError"),
+        ("public", "CachedResponseNotFound", None),  # no cache for dataset-config-names -> CachedResponseNotFound
+    ],
+)
+def test_compute_splits_response_simple_csv_error_2(
+    hub_responses_public: HubDatasetTest,
+    get_job_runner: GetJobRunner,
+    name: str,
+    error_code: str,
+    cause: str,
+    app_config: AppConfig,
+) -> None:
+    dataset = hub_responses_public["name"]
+    config_names_response = hub_responses_public["config_names_response"]
+    config = config_names_response["config_names"][0]["config"] if config_names_response else None
+    job_runner = get_job_runner(dataset, config, app_config)
+    with pytest.raises(CachedArtifactError):
+        job_runner.compute()
+
+
+@pytest.mark.parametrize(
+    "upstream_status,upstream_content,exception_name",
+    [
+        (HTTPStatus.NOT_FOUND, {"error": "error"}, "CachedArtifactError"),
         (HTTPStatus.OK, {"not_config_names": "wrong_format"}, "PreviousStepFormatError"),
         (HTTPStatus.OK, {"config_names": "not a list"}, "PreviousStepFormatError"),
     ],
@@ -576,42 +566,35 @@ def test_previous_step_error(
     get_job_runner: GetJobRunner,
     upstream_status: HTTPStatus,
     upstream_content: Any,
-    error_code: str,
-    hub_public_csv: str,
-    hub_datasets: HubDatasets,
+    exception_name: str,
+    hub_responses_public: HubDatasetTest,
     app_config: AppConfig,
 ) -> None:
-    dataset = hub_datasets["public"]["name"]
-    config = hub_datasets["public"]["config_names_response"]["config_names"][0]["config"]
-    job_runner = get_job_runner(dataset, config, app_config, False)
+    dataset = hub_responses_public["name"]
+    config = hub_responses_public["config_names_response"]["config_names"][0]["config"]
+    job_runner = get_job_runner(dataset, config, app_config)
     upsert_response(
-        "/config-names",
+        "dataset-config-names",
         dataset=dataset,
         http_status=upstream_status,
         content=upstream_content,
     )
-    with pytest.raises(CustomError) as exc_info:
+    with pytest.raises(Exception) as exc_info:
         job_runner.compute()
-    assert exc_info.value.code == error_code
+    assert exc_info.typename == exception_name
 
 
 @pytest.mark.parametrize(
     "filename,split,config,raises",
     [
-        ("config/builder-split.parquet", "split", "config", False),
-        ("config/builder-with-dashes-split.parquet", "split", "config", False),
-        ("config/builder-split-00000-of-00001.parquet", "split", "config", False),
-        ("config/builder-with-dashes-split-00000-of-00001.parquet", "split", "config", False),
-        ("config/builder-split.with.dots-00000-of-00001.parquet", "split.with.dots", "config", False),
-        (
-            "config/builder-with-dashes-caveat-asplitwithdashesisnotsupported-00000-of-00001.parquet",
-            "asplitwithdashesisnotsupported",
-            "config",
-            False,
-        ),
-        ("builder-split-00000-of-00001.parquet", "split", "config", True),
-        ("plain_text/openwebtext-10k-train.parquet", "train", "plain_text", False),
-        ("plain_text/openwebtext-10k-train-00000-of-00001.parquet", "train", "plain_text", False),
+        ("config/split/0000.parquet", "split", "config", False),
+        ("config/split.with.dots/0000.parquet", "split.with.dots", "config", False),
+        ("config/partial-split/0000.parquet", "split", "config", False),
+        ("config/partial-split.with.dots/0000.parquet", "split.with.dots", "config", False),
+        ("config/partial-toomanyzeros/00000.parquet", "toomanyzeros", "config", True),
+        ("config/builder-split.parquet", "split", "config", True),
+        ("plain_text/train/0000.parquet", "train", "plain_text", False),
+        ("plain_text/train/0001.parquet", "train", "plain_text", False),
     ],
 )
 def test_parse_repo_filename(filename: str, split: str, config: str, raises: bool) -> None:
@@ -633,5 +616,364 @@ def test_parse_repo_filename(filename: str, split: str, config: str, raises: boo
         (datasets.info.DatasetInfo(features=Features({"blob": Value("binary")})), True),
     ],
 )
-def test_get_writer_batch_size(ds_info: datasets.info.DatasetInfo, has_big_chunks: bool) -> None:
-    assert get_writer_batch_size(ds_info) == (100 if has_big_chunks else None)
+def test_get_writer_batch_size_from_info(ds_info: datasets.info.DatasetInfo, has_big_chunks: bool) -> None:
+    assert get_writer_batch_size_from_info(ds_info) == (100 if has_big_chunks else None)
+
+
+@pytest.mark.parametrize(
+    "max_operations_per_commit,use_parent_commit,expected_num_commits",
+    [(2, False, 1), (1, False, 2), (2, True, 1), (1, True, 2)],
+)
+def test_create_commits(
+    hub_public_legacy_configs: str, max_operations_per_commit: int, use_parent_commit: bool, expected_num_commits: int
+) -> None:
+    NUM_FILES = 2
+    repo_id = hub_public_legacy_configs
+    hf_api = HfApi(endpoint=CI_HUB_ENDPOINT, token=CI_USER_TOKEN)
+    if use_parent_commit:
+        target_dataset_info = hf_api.dataset_info(repo_id=repo_id, files_metadata=False)
+        parent_commit = target_dataset_info.sha
+    else:
+        parent_commit = None
+    directory = f".test_create_commits_{max_operations_per_commit}_{use_parent_commit}"
+    operations: List[CommitOperationAdd] = [
+        CommitOperationAdd(path_in_repo=f"{directory}/file{i}.txt", path_or_fileobj=f"content{i}".encode("UTF-8"))
+        for i in range(NUM_FILES)
+    ]
+    commit_infos = create_commits(
+        hf_api=hf_api,
+        repo_id=repo_id,
+        operations=operations,
+        commit_message="test",
+        max_operations_per_commit=max_operations_per_commit,
+        parent_commit=parent_commit,
+    )
+    assert len(commit_infos) == expected_num_commits
+    # check that the files were created
+    filenames = hf_api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    for i in range(NUM_FILES):
+        assert f"{directory}/file{i}.txt" in filenames
+
+
+GetDatasetConfigNamesJobRunner = Callable[[str, AppConfig], DatasetConfigNamesJobRunner]
+
+
+@pytest.fixture
+def get_dataset_config_names_job_runner(
+    libraries_resource: LibrariesResource,
+    cache_mongo_resource: CacheMongoResource,
+    queue_mongo_resource: QueueMongoResource,
+) -> GetDatasetConfigNamesJobRunner:
+    def _get_job_runner(
+        dataset: str,
+        app_config: AppConfig,
+    ) -> DatasetConfigNamesJobRunner:
+        processing_step_name = DatasetConfigNamesJobRunner.get_job_type()
+        processing_graph = ProcessingGraph(
+            {
+                processing_step_name: {
+                    "input_type": "dataset",
+                    "job_runner_version": DatasetConfigNamesJobRunner.get_job_runner_version(),
+                }
+            }
+        )
+        return DatasetConfigNamesJobRunner(
+            job_info={
+                "type": DatasetConfigNamesJobRunner.get_job_type(),
+                "params": {
+                    "dataset": dataset,
+                    "revision": "revision",
+                    "config": None,
+                    "split": None,
+                },
+                "job_id": "job_id",
+                "priority": Priority.NORMAL,
+                "difficulty": 50,
+            },
+            app_config=app_config,
+            processing_step=processing_graph.get_processing_step(processing_step_name),
+            hf_datasets_cache=libraries_resource.hf_datasets_cache,
+        )
+
+    return _get_job_runner
+
+
+class JobRunnerArgs(TypedDict):
+    dataset: str
+    revision: str
+    config: str
+    app_config: AppConfig
+    tmp_path: Path
+
+
+def launch_job_runner(job_runner_args: JobRunnerArgs) -> CompleteJobResult:
+    config = job_runner_args["config"]
+    dataset = job_runner_args["dataset"]
+    revision = job_runner_args["revision"]
+    app_config = job_runner_args["app_config"]
+    tmp_path = job_runner_args["tmp_path"]
+    job_runner = ConfigParquetAndInfoJobRunner(
+        job_info=JobInfo(
+            job_id=f"job_{config}",
+            type="config-parquet-and-info",
+            params=JobParams(dataset=dataset, revision=revision, config=config, split=None),
+            priority=Priority.NORMAL,
+            difficulty=50,
+        ),
+        app_config=app_config,
+        processing_step=ProcessingStep(
+            name="config-parquet-and-info",
+            input_type="config",
+            job_runner_version=ConfigParquetAndInfoJobRunner.get_job_runner_version(),
+            difficulty=50,
+        ),
+        hf_datasets_cache=tmp_path,
+    )
+    return job_runner.compute()
+
+
+def test_concurrency(
+    hub_public_n_configs: str,
+    app_config: AppConfig,
+    tmp_path: Path,
+    get_dataset_config_names_job_runner: GetDatasetConfigNamesJobRunner,
+    queue_mongo_resource: QueueMongoResource,
+    cache_mongo_resource: CacheMongoResource,
+) -> None:
+    """
+    Test that multiple job runners (to compute config-parquet-and-info) can run in parallel,
+    without having conflicts when sending commits to the Hub.
+    For this test, we need a lot of configs for the same dataset (say 20) and one job runner for each.
+    Ideally we would try for both quick and slow jobs.
+    """
+    repo_id = hub_public_n_configs
+    hf_api = HfApi(endpoint=CI_HUB_ENDPOINT, token=CI_USER_TOKEN)
+    revision = hf_api.dataset_info(repo_id=repo_id, files_metadata=False).sha
+    if revision is None:
+        raise ValueError(f"Could not find revision for dataset {repo_id}")
+
+    # fill the cache for the step dataset-config-names, required by the job_runner
+    # it's a lot of code 😅
+    job_info = JobInfo(
+        job_id="not_used",
+        type="dataset-config-names",
+        params=JobParams(dataset=repo_id, revision=revision, config=None, split=None),
+        priority=Priority.NORMAL,
+        difficulty=50,
+    )
+    queue = Queue()
+    queue.create_jobs([job_info])
+    job_info = queue.start_job(job_types_only=["dataset-config-names"])
+    job_manager = JobManager(
+        job_info=job_info,
+        app_config=app_config,
+        processing_graph=ProcessingGraph(
+            {
+                "dataset-config-names": {
+                    "input_type": "dataset",
+                    "provides_dataset_config_names": True,
+                    "job_runner_version": DatasetConfigNamesJobRunner.get_job_runner_version(),
+                }
+            }
+        ),
+        job_runner=get_dataset_config_names_job_runner(repo_id, app_config),
+    )
+    job_result = job_manager.run_job()
+    job_manager.finish(job_result=job_result)
+    if not job_result["output"]:
+        raise ValueError("Could not get config names")
+    configs = [str(config_name["config"]) for config_name in job_result["output"]["content"]["config_names"]]
+
+    # launch the job runners
+    NUM_JOB_RUNNERS = 10
+    with Pool(NUM_JOB_RUNNERS) as pool:
+        pool.map(
+            launch_job_runner,
+            [
+                JobRunnerArgs(
+                    dataset=repo_id, revision=revision, config=config, app_config=app_config, tmp_path=tmp_path
+                )
+                for config in configs
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "parquet_files,all_repo_files,config_names,config,deleted_files",
+    [
+        (
+            set(),
+            {"dummy", "c1/dummy", "c1/0.parquet", "c2/0.parquet", "c1/index.duckdb"},
+            {"c1", "c2"},
+            "c1",
+            {"dummy", "c1/dummy", "c1/0.parquet"},
+        ),
+        (
+            {"c1/0.parquet"},
+            {"dummy", "c1/dummy", "c1/0.parquet", "c2/0.parquet", "c1/index.duckdb"},
+            {"c1", "c2"},
+            "c1",
+            {"dummy", "c1/dummy"},
+        ),
+    ],
+)
+def test_get_delete_operations(
+    parquet_files: Set[str], all_repo_files: Set[str], config_names: Set[str], config: str, deleted_files: Set[str]
+) -> None:
+    parquet_operations = [
+        CommitOperationAdd(path_in_repo=path_in_repo, path_or_fileobj=b"") for path_in_repo in parquet_files
+    ]
+    delete_operations = get_delete_operations(
+        parquet_operations=parquet_operations, all_repo_files=all_repo_files, config_names=config_names, config=config
+    )
+    assert set(delete_operation.path_in_repo for delete_operation in delete_operations) == deleted_files
+
+
+@pytest.mark.parametrize(
+    "max_dataset_size,expected_num_shards",
+    [
+        (1, 1),
+        (150, 2),
+        (300, 4),
+        (9999999, 10),
+        (None, 10),
+    ],
+)
+def test_stream_convert_to_parquet_arrowbasedbuilder(
+    csv_path: str, max_dataset_size: int, expected_num_shards: int, tmp_path: Path
+) -> None:
+    num_data_files = 10
+    builder = load_dataset_builder(
+        "csv",
+        data_files={"train": [csv_path] * num_data_files},
+        cache_dir=str(tmp_path / f"test_stream_convert_to_parquet-{max_dataset_size=}"),
+    )
+    with patch("worker.job_runners.config.parquet_and_info.get_writer_batch_size_from_info", lambda ds_config_info: 1):
+        with patch.object(datasets.config, "MAX_SHARD_SIZE", 1):
+            parquet_operations, partial = stream_convert_to_parquet(builder, max_dataset_size=max_dataset_size)
+    num_shards = len(parquet_operations)
+    assert num_shards == expected_num_shards
+    assert partial == (expected_num_shards < num_data_files)
+    assert all(isinstance(op.path_or_fileobj, str) for op in parquet_operations)
+    parquet_files = list_generated_parquet_files(builder, partial=partial)
+    assert len(parquet_files) == expected_num_shards
+    assert all(os.path.isfile(parquet_file.local_file) for parquet_file in parquet_files)
+    if max_dataset_size is not None:
+        one_sample_max_size = 100
+        expected_max_dataset_size = max_dataset_size + one_sample_max_size
+        assert (
+            sum(pq.ParquetFile(parquet_file.local_file).read().nbytes for parquet_file in parquet_files)
+            < expected_max_dataset_size
+        )
+
+
+@pytest.mark.parametrize(
+    "max_dataset_size,expected_num_shards",
+    [
+        (1, 1),
+        (150, 19),
+        (300, 38),
+        (9999999, 1000),
+        (None, 1000),
+    ],
+)
+def test_stream_convert_to_parquet_generatorbasedbuilder(
+    max_dataset_size: int, expected_num_shards: int, tmp_path: Path
+) -> None:
+    num_rows = 1000
+
+    def long_generator() -> Iterator[Dict[str, int]]:
+        for i in range(num_rows):
+            yield {"foo": i}
+
+    cache_dir = str(tmp_path / "test_limit_parquet_writes_cache_dir")
+    builder = ParametrizedGeneratorBasedBuilder(generator=long_generator, cache_dir=cache_dir)
+    with patch("worker.job_runners.config.parquet_and_info.get_writer_batch_size_from_info", lambda ds_config_info: 1):
+        with patch.object(datasets.config, "MAX_SHARD_SIZE", 1):
+            parquet_operations, partial = stream_convert_to_parquet(builder, max_dataset_size=max_dataset_size)
+    num_shards = len(parquet_operations)
+    assert num_shards == expected_num_shards
+    assert partial == (expected_num_shards < num_rows)
+    assert all(isinstance(op.path_or_fileobj, str) for op in parquet_operations)
+    parquet_files = list_generated_parquet_files(builder, partial=partial)
+    assert len(parquet_files) == expected_num_shards
+    assert all(os.path.isfile(parquet_file.local_file) for parquet_file in parquet_files)
+    if max_dataset_size is not None:
+        one_sample_max_size = 100
+        expected_max_dataset_size = max_dataset_size + one_sample_max_size
+        assert (
+            sum(pq.ParquetFile(parquet_file.local_file).read().nbytes for parquet_file in parquet_files)
+            < expected_max_dataset_size
+        )
+
+
+def test_limit_parquet_writes(tmp_path: Path) -> None:
+    num_examples = 0
+
+    def long_generator() -> Iterator[Dict[str, int]]:
+        nonlocal num_examples
+        for i in range(10_000_000):
+            yield {"foo": i}
+            num_examples += 1
+
+    one_sample_size = 8
+    max_dataset_size = 50_000
+    expected_max_dataset_size = max_dataset_size + datasets.config.DEFAULT_MAX_BATCH_SIZE * one_sample_size
+    expected_max_num_examples = 1 + max_dataset_size // one_sample_size + datasets.config.DEFAULT_MAX_BATCH_SIZE
+    cache_dir = str(tmp_path / "test_limit_parquet_writes_cache_dir")
+    builder = ParametrizedGeneratorBasedBuilder(generator=long_generator, cache_dir=cache_dir)
+    with limit_parquet_writes(builder, max_dataset_size=max_dataset_size) as limiter:
+        builder.download_and_prepare(file_format="parquet")
+        assert builder.info.dataset_size == limiter.total_bytes <= expected_max_dataset_size
+        assert builder.info.splits["train"].num_examples == num_examples < expected_max_num_examples
+
+
+@pytest.mark.parametrize(
+    "validate,too_big_row_groups",
+    [
+        (None, False),
+        (ParquetFileValidator(max_row_group_byte_size=1).validate, True),
+        (ParquetFileValidator(max_row_group_byte_size=100_000).validate, False),
+    ],
+)
+def test_fill_builder_info(
+    hub_responses_big: HubDatasetTest,
+    app_config: AppConfig,
+    tmp_path: Path,
+    validate: Optional[Callable[[pq.ParquetFile], None]],
+    too_big_row_groups: bool,
+) -> None:
+    cache_dir = str(tmp_path / "test_fill_builder_info")
+    name = hub_responses_big["name"]
+    builder = load_dataset_builder(name, cache_dir=cache_dir)
+    builder.info = datasets.info.DatasetInfo()
+    if too_big_row_groups:
+        with pytest.raises(TooBigRowGroupsError) as exc_info:
+            fill_builder_info(builder, hf_endpoint=app_config.common.hf_endpoint, hf_token=None, validate=validate)
+        assert isinstance(exc_info.value, TooBigRowGroupsError)
+        assert isinstance(exc_info.value.num_rows, int)
+        assert isinstance(exc_info.value.row_group_byte_size, int)
+    else:
+        fill_builder_info(builder, hf_endpoint=app_config.common.hf_endpoint, hf_token=None, validate=validate)
+        expected_info = hub_responses_big["parquet_and_info_response"]["dataset_info"]
+        assert expected_info == asdict(builder.info)
+
+
+@pytest.mark.parametrize(
+    "num_rows, row_group_byte_size, max_row_group_byte_size, expected",
+    [
+        (1000, 1000, 500, 100),
+        (1000, 1000_000, 500_000, 100),
+        (123456789, 123456789, 1000, 100),
+        (987654321, 987654321, 1000, 900),
+        (1000, 10, 1000, 1000),
+        (10, 1000, 1000, 100),
+    ],
+)
+def test_get_writer_batch_size_from_row_group_size(
+    num_rows: int, row_group_byte_size: int, max_row_group_byte_size: int, expected: int
+) -> None:
+    writer_batch_size = get_writer_batch_size_from_row_group_size(
+        num_rows=num_rows, row_group_byte_size=row_group_byte_size, max_row_group_byte_size=max_row_group_byte_size
+    )
+    assert writer_batch_size == expected

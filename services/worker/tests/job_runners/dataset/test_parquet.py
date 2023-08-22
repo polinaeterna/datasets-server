@@ -5,20 +5,15 @@ from http import HTTPStatus
 from typing import Any, Callable
 
 import pytest
-from libcommon.processing_graph import ProcessingStep
-from libcommon.queue import Priority
+from libcommon.exceptions import PreviousStepFormatError
+from libcommon.processing_graph import ProcessingGraph
 from libcommon.resources import CacheMongoResource, QueueMongoResource
-from libcommon.simple_cache import upsert_response
+from libcommon.simple_cache import CachedArtifactError, upsert_response
+from libcommon.utils import Priority, SplitHubFile
 
 from worker.config import AppConfig
-from worker.job_runner import PreviousStepError
-from worker.job_runners.config.parquet import ConfigParquetResponse
-from worker.job_runners.config.parquet_and_info import ParquetFileItem
-from worker.job_runners.dataset.parquet import (
-    DatasetParquetJobRunner,
-    DatasetParquetResponse,
-    PreviousStepFormatError,
-)
+from worker.dtos import ConfigParquetResponse, DatasetParquetResponse
+from worker.job_runners.dataset.parquet import DatasetParquetJobRunner
 
 from ..utils import UpstreamResponse
 
@@ -29,7 +24,7 @@ def prepare_and_clean_mongo(app_config: AppConfig) -> None:
     pass
 
 
-GetJobRunner = Callable[[str, AppConfig, bool], DatasetParquetJobRunner]
+GetJobRunner = Callable[[str, AppConfig], DatasetParquetJobRunner]
 
 
 @pytest.fixture
@@ -40,30 +35,31 @@ def get_job_runner(
     def _get_job_runner(
         dataset: str,
         app_config: AppConfig,
-        force: bool = False,
     ) -> DatasetParquetJobRunner:
+        processing_step_name = DatasetParquetJobRunner.get_job_type()
+        processing_graph = ProcessingGraph(
+            {
+                processing_step_name: {
+                    "input_type": "dataset",
+                    "job_runner_version": DatasetParquetJobRunner.get_job_runner_version(),
+                }
+            }
+        )
         return DatasetParquetJobRunner(
             job_info={
                 "type": DatasetParquetJobRunner.get_job_type(),
-                "dataset": dataset,
-                "config": None,
-                "split": None,
+                "params": {
+                    "dataset": dataset,
+                    "revision": "revision",
+                    "config": None,
+                    "split": None,
+                },
                 "job_id": "job_id",
-                "force": force,
                 "priority": Priority.NORMAL,
+                "difficulty": 50,
             },
-            common_config=app_config.common,
-            worker_config=app_config.worker,
-            processing_step=ProcessingStep(
-                name=DatasetParquetJobRunner.get_job_type(),
-                input_type="dataset",
-                requires=[],
-                required_by_dataset_viewer=False,
-                ancestors=[],
-                children=[],
-                parents=[],
-                job_runner_version=DatasetParquetJobRunner.get_job_runner_version(),
-            ),
+            app_config=app_config,
+            processing_step=processing_graph.get_processing_step(processing_step_name),
         )
 
     return _get_job_runner
@@ -76,7 +72,7 @@ def get_job_runner(
             "ok",
             [
                 UpstreamResponse(
-                    kind="/config-names",
+                    kind="dataset-config-names",
                     dataset="ok",
                     config=None,
                     http_status=HTTPStatus.OK,
@@ -94,7 +90,7 @@ def get_job_runner(
                     http_status=HTTPStatus.OK,
                     content=ConfigParquetResponse(
                         parquet_files=[
-                            ParquetFileItem(
+                            SplitHubFile(
                                 dataset="ok",
                                 config="config_1",
                                 split="train",
@@ -102,7 +98,9 @@ def get_job_runner(
                                 filename="filename1",
                                 size=0,
                             ),
-                        ]
+                        ],
+                        partial=False,
+                        features=None,
                     ),
                 ),
                 UpstreamResponse(
@@ -112,7 +110,7 @@ def get_job_runner(
                     http_status=HTTPStatus.OK,
                     content=ConfigParquetResponse(
                         parquet_files=[
-                            ParquetFileItem(
+                            SplitHubFile(
                                 dataset="ok",
                                 config="config_2",
                                 split="train",
@@ -120,22 +118,25 @@ def get_job_runner(
                                 filename="filename2",
                                 size=0,
                             ),
-                        ]
+                        ],
+                        partial=False,
+                        features=None,
                     ),
                 ),
             ],
             None,
             DatasetParquetResponse(
                 parquet_files=[
-                    ParquetFileItem(
+                    SplitHubFile(
                         dataset="ok", config="config_1", split="train", url="url1", filename="filename1", size=0
                     ),
-                    ParquetFileItem(
+                    SplitHubFile(
                         dataset="ok", config="config_2", split="train", url="url2", filename="filename2", size=0
                     ),
                 ],
                 pending=[],
                 failed=[],
+                partial=False,
             ),
             False,
         ),
@@ -143,14 +144,14 @@ def get_job_runner(
             "status_error",
             [
                 UpstreamResponse(
-                    kind="/config-names",
+                    kind="dataset-config-names",
                     dataset="status_error",
                     config=None,
                     http_status=HTTPStatus.NOT_FOUND,
                     content={"error": "error"},
                 )
             ],
-            PreviousStepError.__name__,
+            CachedArtifactError.__name__,
             None,
             True,
         ),
@@ -158,7 +159,7 @@ def get_job_runner(
             "format_error",
             [
                 UpstreamResponse(
-                    kind="/config-names",
+                    kind="dataset-config-names",
                     dataset="format_error",
                     config=None,
                     http_status=HTTPStatus.OK,
@@ -182,17 +183,17 @@ def test_compute(
 ) -> None:
     for upstream_response in upstream_responses:
         upsert_response(**upstream_response)
-    job_runner = get_job_runner(dataset, app_config, False)
+    job_runner = get_job_runner(dataset, app_config)
     if should_raise:
         with pytest.raises(Exception) as e:
             job_runner.compute()
-        assert e.type.__name__ == expected_error_code
+        assert e.typename == expected_error_code
     else:
         assert job_runner.compute().content == expected_content
 
 
 def test_doesnotexist(app_config: AppConfig, get_job_runner: GetJobRunner) -> None:
     dataset = "doesnotexist"
-    job_runner = get_job_runner(dataset, app_config, False)
-    with pytest.raises(PreviousStepError):
+    job_runner = get_job_runner(dataset, app_config)
+    with pytest.raises(CachedArtifactError):
         job_runner.compute()

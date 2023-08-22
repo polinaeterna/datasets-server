@@ -3,65 +3,26 @@
 
 import logging
 from http import HTTPStatus
-from typing import Any, Literal, Mapping, Optional, Tuple, TypedDict
+from typing import Optional, Tuple
 
 from libcommon.constants import PROCESSING_STEP_DATASET_SIZE_VERSION
-from libcommon.simple_cache import DoesNotExist, SplitFullName, get_response
-
-from worker.job_runner import (
-    JobResult,
-    JobRunner,
-    JobRunnerError,
-    ParameterMissingError,
+from libcommon.exceptions import PreviousStepFormatError
+from libcommon.simple_cache import (
+    CacheEntryDoesNotExistError,
     get_previous_step_or_raise,
+    get_response,
 )
-from worker.job_runners.config.size import ConfigSize, ConfigSizeResponse, SplitSize
-from worker.utils import PreviousJob
 
-SizesJobRunnerErrorCode = Literal["PreviousStepFormatError"]
-
-
-class DatasetSize(TypedDict):
-    dataset: str
-    num_bytes_original_files: int
-    num_bytes_parquet_files: int
-    num_bytes_memory: int
-    num_rows: int
-
-
-class DatasetSizeContent(TypedDict):
-    dataset: DatasetSize
-    configs: list[ConfigSize]
-    splits: list[SplitSize]
-
-
-class DatasetSizeResponse(TypedDict):
-    size: DatasetSizeContent
-    pending: list[PreviousJob]
-    failed: list[PreviousJob]
-
-
-class DatasetSizeJobRunnerError(JobRunnerError):
-    """Base class for exceptions in this module."""
-
-    def __init__(
-        self,
-        message: str,
-        status_code: HTTPStatus,
-        code: SizesJobRunnerErrorCode,
-        cause: Optional[BaseException] = None,
-        disclose_cause: bool = False,
-    ):
-        super().__init__(
-            message=message, status_code=status_code, code=code, cause=cause, disclose_cause=disclose_cause
-        )
-
-
-class PreviousStepFormatError(DatasetSizeJobRunnerError):
-    """Raised when the content of the previous step has not the expected format."""
-
-    def __init__(self, message: str, cause: Optional[BaseException] = None):
-        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "PreviousStepFormatError", cause, False)
+from worker.dtos import (
+    ConfigSize,
+    ConfigSizeResponse,
+    DatasetSize,
+    DatasetSizeResponse,
+    JobResult,
+    PreviousJob,
+    SplitSize,
+)
+from worker.job_runners.dataset.dataset_job_runner import DatasetJobRunner
 
 
 def compute_sizes_response(dataset: str) -> Tuple[DatasetSizeResponse, float]:
@@ -73,17 +34,15 @@ def compute_sizes_response(dataset: str) -> Tuple[DatasetSizeResponse, float]:
             by a `/`.
     Returns:
         `DatasetSizeResponse`: An object with the sizes_response.
-    <Tip>
     Raises the following errors:
-        - [`~job_runner.PreviousStepError`]
+        - [`libcommon.simple_cache.CachedArtifactError`]
           If the previous step gave an error.
-        - [`~job_runners.dataset.size.PreviousStepFormatError`]
+        - [`libcommon.exceptions.PreviousStepFormatError`]
             If the content of the previous step has not the expected format
-    </Tip>
     """
     logging.info(f"get sizes for dataset={dataset}")
 
-    config_names_best_response = get_previous_step_or_raise(kinds=["/config-names"], dataset=dataset)
+    config_names_best_response = get_previous_step_or_raise(kinds=["dataset-config-names"], dataset=dataset)
     content = config_names_best_response.response["content"]
     if "config_names" not in content:
         raise PreviousStepFormatError("Previous step did not return the expected content: 'config_names'.")
@@ -94,12 +53,13 @@ def compute_sizes_response(dataset: str) -> Tuple[DatasetSizeResponse, float]:
         total = 0
         pending = []
         failed = []
+        partial = False
         for config_item in content["config_names"]:
             config = config_item["config"]
             total += 1
             try:
                 response = get_response(kind="config-size", dataset=dataset, config=config)
-            except DoesNotExist:
+            except CacheEntryDoesNotExistError:
                 logging.debug("No response found in previous step for this dataset: 'config-size' endpoint.")
                 pending.append(
                     PreviousJob(
@@ -125,12 +85,22 @@ def compute_sizes_response(dataset: str) -> Tuple[DatasetSizeResponse, float]:
                     )
                 )
                 continue
-            config_size_content = ConfigSizeResponse(size=response["content"]["size"])
+            config_size_content = ConfigSizeResponse(
+                size=response["content"]["size"], partial=response["content"]["partial"]
+            )
             config_sizes.append(config_size_content["size"]["config"])
             split_sizes.extend(config_size_content["size"]["splits"])
+            partial = partial or config_size_content["partial"]
+        num_bytes_original_files: Optional[int] = 0
+        for config_size in config_sizes:
+            if num_bytes_original_files is not None and isinstance(config_size["num_bytes_original_files"], int):
+                num_bytes_original_files += config_size["num_bytes_original_files"]
+            else:
+                num_bytes_original_files = None
+                break
         dataset_size: DatasetSize = {
             "dataset": dataset,
-            "num_bytes_original_files": sum(config_size["num_bytes_original_files"] for config_size in config_sizes),
+            "num_bytes_original_files": num_bytes_original_files,
             "num_bytes_parquet_files": sum(config_size["num_bytes_parquet_files"] for config_size in config_sizes),
             "num_bytes_memory": sum(config_size["num_bytes_memory"] for config_size in config_sizes),
             "num_rows": sum(config_size["num_rows"] for config_size in config_sizes),
@@ -150,13 +120,14 @@ def compute_sizes_response(dataset: str) -> Tuple[DatasetSizeResponse, float]:
                 },
                 "pending": pending,
                 "failed": failed,
+                "partial": partial,
             }
         ),
         progress,
     )
 
 
-class DatasetSizeJobRunner(JobRunner):
+class DatasetSizeJobRunner(DatasetJobRunner):
     @staticmethod
     def get_job_type() -> str:
         return "dataset-size"
@@ -166,14 +137,5 @@ class DatasetSizeJobRunner(JobRunner):
         return PROCESSING_STEP_DATASET_SIZE_VERSION
 
     def compute(self) -> JobResult:
-        if self.dataset is None:
-            raise ParameterMissingError("'dataset' parameter is required")
         response_content, progress = compute_sizes_response(dataset=self.dataset)
         return JobResult(response_content, progress=progress)
-
-    def get_new_splits(self, content: Mapping[str, Any]) -> set[SplitFullName]:
-        """Get the set of new splits, from the content created by the compute."""
-        return {
-            SplitFullName(dataset=split_size["dataset"], config=split_size["config"], split=split_size["split"])
-            for split_size in content["size"]["splits"]
-        }

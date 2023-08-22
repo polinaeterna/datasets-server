@@ -5,13 +5,12 @@ from http import HTTPStatus
 from typing import Any, Callable, List
 
 import pytest
-from libcommon.processing_graph import ProcessingStep
-from libcommon.queue import Priority
+from libcommon.processing_graph import ProcessingGraph
 from libcommon.resources import CacheMongoResource, QueueMongoResource
-from libcommon.simple_cache import upsert_response
+from libcommon.simple_cache import CachedArtifactError, upsert_response
+from libcommon.utils import Priority
 
 from worker.config import AppConfig
-from worker.job_runner import PreviousStepError
 from worker.job_runners.config.opt_in_out_urls_count import (
     ConfigOptInOutUrlsCountJobRunner,
 )
@@ -23,7 +22,7 @@ def prepare_and_clean_mongo(app_config: AppConfig) -> None:
     pass
 
 
-GetJobRunner = Callable[[str, str, AppConfig, bool], ConfigOptInOutUrlsCountJobRunner]
+GetJobRunner = Callable[[str, str, AppConfig], ConfigOptInOutUrlsCountJobRunner]
 
 
 @pytest.fixture
@@ -35,30 +34,33 @@ def get_job_runner(
         dataset: str,
         config: str,
         app_config: AppConfig,
-        force: bool = False,
     ) -> ConfigOptInOutUrlsCountJobRunner:
+        processing_step_name = ConfigOptInOutUrlsCountJobRunner.get_job_type()
+        processing_graph = ProcessingGraph(
+            {
+                "dataset-level": {"input_type": "dataset"},
+                processing_step_name: {
+                    "input_type": "config",
+                    "job_runner_version": ConfigOptInOutUrlsCountJobRunner.get_job_runner_version(),
+                    "triggered_by": "dataset-level",
+                },
+            }
+        )
         return ConfigOptInOutUrlsCountJobRunner(
             job_info={
                 "type": ConfigOptInOutUrlsCountJobRunner.get_job_type(),
-                "dataset": dataset,
-                "config": config,
-                "split": None,
+                "params": {
+                    "dataset": dataset,
+                    "revision": "revision",
+                    "config": config,
+                    "split": None,
+                },
                 "job_id": "job_id",
-                "force": force,
                 "priority": Priority.NORMAL,
+                "difficulty": 50,
             },
-            common_config=app_config.common,
-            worker_config=app_config.worker,
-            processing_step=ProcessingStep(
-                name=ConfigOptInOutUrlsCountJobRunner.get_job_type(),
-                input_type="config",
-                requires=[],
-                required_by_dataset_viewer=False,
-                ancestors=[],
-                children=[],
-                parents=[],
-                job_runner_version=ConfigOptInOutUrlsCountJobRunner.get_job_runner_version(),
-            ),
+            app_config=app_config,
+            processing_step=processing_graph.get_processing_step(processing_step_name),
         )
 
     return _get_job_runner
@@ -69,16 +71,17 @@ def get_job_runner(
     + ",spawning_content,expected_error_code,expected_content,should_raise",
     [
         (
-            "dataset_ok",
+            "dataset_ok_full_scan",
             "config",
             HTTPStatus.OK,
             {
                 "splits": [
-                    {"dataset": "dataset_ok", "config": "config", "split": "split"},
-                    {"dataset": "dataset_ok", "config": "config", "split": "split2"},
+                    {"dataset": "dataset_ok_full_scan", "config": "config", "split": "split"},
+                    {"dataset": "dataset_ok_full_scan", "config": "config", "split": "split2"},
+                    {"dataset": "dataset_ok_full_scan", "config": "config", "split": "split3"},
                 ]
             },
-            [HTTPStatus.OK, HTTPStatus.OK],
+            [HTTPStatus.OK, HTTPStatus.OK, HTTPStatus.OK],
             [
                 {
                     "urls_columns": ["url"],
@@ -87,6 +90,7 @@ def get_job_runner(
                     "num_urls": 10,
                     "num_scanned_rows": 100,
                     "has_urls_columns": True,
+                    "full_scan": True,
                 },
                 {
                     "urls_columns": [],
@@ -95,6 +99,16 @@ def get_job_runner(
                     "num_urls": 0,
                     "num_scanned_rows": 30,
                     "has_urls_columns": False,
+                    "full_scan": True,
+                },
+                {
+                    "urls_columns": [],
+                    "num_opt_in_urls": 0,
+                    "num_opt_out_urls": 0,
+                    "num_urls": 0,
+                    "num_scanned_rows": 30,
+                    "has_urls_columns": False,
+                    "full_scan": True,
                 },
             ],
             None,
@@ -103,8 +117,62 @@ def get_job_runner(
                 "num_opt_in_urls": 1,
                 "num_opt_out_urls": 2,
                 "num_urls": 10,
-                "num_scanned_rows": 130,
+                "num_scanned_rows": 160,
                 "has_urls_columns": True,
+                "full_scan": True,
+            },
+            False,
+        ),
+        (
+            "dataset_ok_not_full_scan",
+            "config",
+            HTTPStatus.OK,
+            {
+                "splits": [
+                    {"dataset": "dataset_ok_not_full_scan", "config": "config", "split": "split"},
+                    {"dataset": "dataset_ok_not_full_scan", "config": "config", "split": "split2"},
+                    {"dataset": "dataset_ok_not_full_scan", "config": "config", "split": "split3"},
+                ]
+            },
+            [HTTPStatus.OK, HTTPStatus.OK, HTTPStatus.OK],
+            [
+                {
+                    "urls_columns": ["url"],
+                    "num_opt_in_urls": 1,
+                    "num_opt_out_urls": 2,
+                    "num_urls": 10,
+                    "num_scanned_rows": 100,
+                    "has_urls_columns": True,
+                    "full_scan": False,
+                },
+                {
+                    "urls_columns": [],
+                    "num_opt_in_urls": 0,
+                    "num_opt_out_urls": 0,
+                    "num_urls": 0,
+                    "num_scanned_rows": 30,
+                    "has_urls_columns": False,
+                    "full_scan": True,
+                },
+                {
+                    "urls_columns": [],
+                    "num_opt_in_urls": 0,
+                    "num_opt_out_urls": 0,
+                    "num_urls": 0,
+                    "num_scanned_rows": 30,
+                    "has_urls_columns": False,
+                    "full_scan": True,
+                },
+            ],
+            None,
+            {
+                "urls_columns": ["url"],
+                "num_opt_in_urls": 1,
+                "num_opt_out_urls": 2,
+                "num_urls": 10,
+                "num_scanned_rows": 160,
+                "has_urls_columns": True,
+                "full_scan": False,
             },
             False,
         ),
@@ -115,7 +183,7 @@ def get_job_runner(
             {},
             [],
             [],
-            "PreviousStepError",
+            "CachedArtifactError",
             None,
             True,
         ),
@@ -151,7 +219,7 @@ def test_compute(
     should_raise: bool,
 ) -> None:
     upsert_response(
-        kind="/split-names-from-streaming",
+        kind="config-split-names-from-streaming",
         dataset=dataset,
         config=config,
         content=split_names_content,
@@ -169,17 +237,17 @@ def test_compute(
                 http_status=status,
             )
 
-    job_runner = get_job_runner(dataset, config, app_config, False)
+    job_runner = get_job_runner(dataset, config, app_config)
     if should_raise:
         with pytest.raises(Exception) as e:
             job_runner.compute()
-        assert e.type.__name__ == expected_error_code
+        assert e.typename == expected_error_code
     else:
         assert job_runner.compute().content == expected_content
 
 
 def test_doesnotexist(app_config: AppConfig, get_job_runner: GetJobRunner) -> None:
     dataset = config = "doesnotexist"
-    job_runner = get_job_runner(dataset, config, app_config, False)
-    with pytest.raises(PreviousStepError):
+    job_runner = get_job_runner(dataset, config, app_config)
+    with pytest.raises(CachedArtifactError):
         job_runner.compute()

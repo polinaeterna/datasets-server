@@ -70,6 +70,7 @@ def queue_mongo_resource(queue_mongo_host: str) -> Iterator[QueueMongoResource]:
             raise RuntimeError("Mongo resource is not available")
         yield queue_mongo_resource
         _clean_queue_database()
+        queue_mongo_resource.release()
 
 
 @fixture
@@ -81,3 +82,4 @@ def cache_mongo_resource(cache_mongo_host: str) -> Iterator[CacheMongoResource]:
     with CacheMongoResource(database=database, host=host) as cache_mongo_resource:
         yield cache_mongo_resource
         _clean_cache_database()
+        cache_mongo_resource.release()

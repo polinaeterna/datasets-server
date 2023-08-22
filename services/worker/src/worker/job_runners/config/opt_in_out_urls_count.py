@@ -3,51 +3,27 @@
 
 import logging
 from http import HTTPStatus
-from typing import Any, Literal, Mapping, Optional, Tuple
+from typing import Tuple
 
 from libcommon.constants import PROCESSING_STEP_CONFIG_OPT_IN_OUT_URLS_COUNT_VERSION
-from libcommon.simple_cache import DoesNotExist, SplitFullName, get_response
-
-from worker.job_runner import (
-    JobResult,
-    JobRunner,
-    JobRunnerError,
-    ParameterMissingError,
+from libcommon.exceptions import PreviousStepFormatError
+from libcommon.simple_cache import (
+    CacheEntryDoesNotExistError,
     get_previous_step_or_raise,
+    get_response,
 )
-from worker.utils import OptInOutUrlsCountResponse
 
-ConfigOptInOutUrlsCountJobRunnerErrorCode = Literal["PreviousStepFormatError"]
-
-
-class ConfigOptInOutUrlsCountJobRunnerError(JobRunnerError):
-    """Base class for exceptions in this module."""
-
-    def __init__(
-        self,
-        message: str,
-        status_code: HTTPStatus,
-        code: ConfigOptInOutUrlsCountJobRunnerErrorCode,
-        cause: Optional[BaseException] = None,
-        disclose_cause: bool = False,
-    ):
-        super().__init__(
-            message=message, status_code=status_code, code=code, cause=cause, disclose_cause=disclose_cause
-        )
-
-
-class PreviousStepFormatError(ConfigOptInOutUrlsCountJobRunnerError):
-    """Raised when the content of the previous step has not the expected format."""
-
-    def __init__(self, message: str, cause: Optional[BaseException] = None):
-        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "PreviousStepFormatError", cause, False)
+from worker.dtos import JobResult, OptInOutUrlsCountResponse
+from worker.job_runners.config.config_job_runner import ConfigJobRunner
 
 
 def compute_opt_in_out_urls_scan_response(dataset: str, config: str) -> Tuple[OptInOutUrlsCountResponse, float]:
     logging.info(f"get config-opt-in-out-urls-count for dataset={dataset} config={config}")
 
     split_names_response = get_previous_step_or_raise(
-        kinds=["/split-names-from-streaming"], dataset=dataset, config=config
+        kinds=["config-split-names-from-streaming", "config-split-names-from-info"],
+        dataset=dataset,
+        config=config,
     )
     content = split_names_response.response["content"]
     if "splits" not in content:
@@ -58,6 +34,7 @@ def compute_opt_in_out_urls_scan_response(dataset: str, config: str) -> Tuple[Op
     num_opt_out_urls = 0
     num_urls = 0
     num_scanned_rows = 0
+    full_scan_count = 0
     try:
         total = 0
         pending = 0
@@ -68,7 +45,7 @@ def compute_opt_in_out_urls_scan_response(dataset: str, config: str) -> Tuple[Op
                 response = get_response(
                     kind="split-opt-in-out-urls-count", dataset=dataset, config=config, split=split
                 )
-            except DoesNotExist:
+            except CacheEntryDoesNotExistError:
                 logging.debug("No response found in previous step for this dataset: 'split-opt-in-out-urls-count'.")
                 pending += 1
                 continue
@@ -81,12 +58,14 @@ def compute_opt_in_out_urls_scan_response(dataset: str, config: str) -> Tuple[Op
             num_opt_out_urls += split_opt_in_out_content["num_opt_out_urls"]
             num_urls += split_opt_in_out_content["num_urls"]
             num_scanned_rows += split_opt_in_out_content["num_scanned_rows"]
+            full_scan_count += 1 if split_opt_in_out_content["full_scan"] else 0
     except Exception as e:
         raise PreviousStepFormatError("Previous step did not return the expected content.", e) from e
 
     unique_urls_columns = sorted(list(set(urls_columns)))
     has_urls_columns = len(unique_urls_columns) > 0
     progress = (total - pending) / total if total else 1.0
+    full_scan = full_scan_count == total
 
     return (
         OptInOutUrlsCountResponse(
@@ -96,12 +75,13 @@ def compute_opt_in_out_urls_scan_response(dataset: str, config: str) -> Tuple[Op
             num_opt_out_urls=num_opt_out_urls,
             num_scanned_rows=num_scanned_rows,
             num_urls=num_urls,
+            full_scan=full_scan,
         ),
         progress,
     )
 
 
-class ConfigOptInOutUrlsCountJobRunner(JobRunner):
+class ConfigOptInOutUrlsCountJobRunner(ConfigJobRunner):
     @staticmethod
     def get_job_type() -> str:
         return "config-opt-in-out-urls-count"
@@ -111,13 +91,5 @@ class ConfigOptInOutUrlsCountJobRunner(JobRunner):
         return PROCESSING_STEP_CONFIG_OPT_IN_OUT_URLS_COUNT_VERSION
 
     def compute(self) -> JobResult:
-        if self.dataset is None:
-            raise ParameterMissingError("'dataset' parameter is required")
-        if self.config is None:
-            raise ParameterMissingError("'config' parameter is required")
         response_content, progress = compute_opt_in_out_urls_scan_response(dataset=self.dataset, config=self.config)
         return JobResult(response_content, progress=progress)
-
-    def get_new_splits(self, _: Mapping[str, Any]) -> set[SplitFullName]:
-        """Get the set of new splits, from the content created by the compute."""
-        return {SplitFullName(dataset=self.dataset, config=self.config, split=None)}

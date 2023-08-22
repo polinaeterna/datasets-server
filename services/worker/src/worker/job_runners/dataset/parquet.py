@@ -3,55 +3,27 @@
 
 import logging
 from http import HTTPStatus
-from typing import Any, List, Literal, Mapping, Optional, Tuple, TypedDict
+from typing import Tuple
 
 from libcommon.constants import PROCESSING_STEP_DATASET_PARQUET_VERSION
-from libcommon.simple_cache import DoesNotExist, SplitFullName, get_response
-
-from worker.job_runner import (
-    JobResult,
-    JobRunner,
-    JobRunnerError,
-    ParameterMissingError,
+from libcommon.exceptions import PreviousStepFormatError
+from libcommon.simple_cache import (
+    CacheEntryDoesNotExistError,
     get_previous_step_or_raise,
+    get_response,
 )
-from worker.job_runners.config.parquet import ConfigParquetResponse
-from worker.job_runners.config.parquet_and_info import ParquetFileItem
-from worker.utils import PreviousJob
+from libcommon.utils import SplitHubFile
 
-SizesJobRunnerErrorCode = Literal["PreviousStepFormatError"]
-
-
-class DatasetParquetResponse(TypedDict):
-    parquet_files: List[ParquetFileItem]
-    pending: list[PreviousJob]
-    failed: list[PreviousJob]
+from worker.dtos import (
+    ConfigParquetResponse,
+    DatasetParquetResponse,
+    JobResult,
+    PreviousJob,
+)
+from worker.job_runners.dataset.dataset_job_runner import DatasetJobRunner
 
 
-class DatasetParquetJobRunnerError(JobRunnerError):
-    """Base class for exceptions in this module."""
-
-    def __init__(
-        self,
-        message: str,
-        status_code: HTTPStatus,
-        code: SizesJobRunnerErrorCode,
-        cause: Optional[BaseException] = None,
-        disclose_cause: bool = False,
-    ):
-        super().__init__(
-            message=message, status_code=status_code, code=code, cause=cause, disclose_cause=disclose_cause
-        )
-
-
-class PreviousStepFormatError(DatasetParquetJobRunnerError):
-    """Raised when the content of the previous step has not the expected format."""
-
-    def __init__(self, message: str, cause: Optional[BaseException] = None):
-        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "PreviousStepFormatError", cause, False)
-
-
-def compute_sizes_response(dataset: str) -> Tuple[DatasetParquetResponse, float]:
+def compute_parquet_response(dataset: str) -> Tuple[DatasetParquetResponse, float]:
     """
     Get the response of dataset-parquet for one specific dataset on huggingface.co.
     Args:
@@ -60,32 +32,31 @@ def compute_sizes_response(dataset: str) -> Tuple[DatasetParquetResponse, float]
             by a `/`.
     Returns:
         `DatasetParquetResponse`: An object with the parquet_response (list of parquet files).
-    <Tip>
     Raises the following errors:
-        - [`~job_runner.PreviousStepError`]
+        - [`libcommon.simple_cache.CachedArtifactError`]
           If the previous step gave an error.
-        - [`~job_runners.dataset.parquet.PreviousStepFormatError`]
+        - [`libcommon.exceptions.PreviousStepFormatError`]
             If the content of the previous step has not the expected format
-    </Tip>
     """
     logging.info(f"get parquet files for dataset={dataset}")
 
-    config_names_best_response = get_previous_step_or_raise(kinds=["/config-names"], dataset=dataset)
+    config_names_best_response = get_previous_step_or_raise(kinds=["dataset-config-names"], dataset=dataset)
     content = config_names_best_response.response["content"]
     if "config_names" not in content:
         raise PreviousStepFormatError("Previous step did not return the expected content: 'config_names'.")
 
     try:
-        parquet_files: list[ParquetFileItem] = []
+        parquet_files: list[SplitHubFile] = []
         total = 0
         pending = []
         failed = []
+        partial = False
         for config_item in content["config_names"]:
             config = config_item["config"]
             total += 1
             try:
                 response = get_response(kind="config-parquet", dataset=dataset, config=config)
-            except DoesNotExist:
+            except CacheEntryDoesNotExistError:
                 logging.debug("No response found in previous step for this dataset: 'config-parquet' endpoint.")
                 pending.append(
                     PreviousJob(
@@ -111,24 +82,25 @@ def compute_sizes_response(dataset: str) -> Tuple[DatasetParquetResponse, float]
                     )
                 )
                 continue
-            config_parquet_content = ConfigParquetResponse(parquet_files=response["content"]["parquet_files"])
+            config_parquet_content = ConfigParquetResponse(
+                parquet_files=response["content"]["parquet_files"],
+                partial=response["content"]["partial"],
+                features=None,  # we can keep it None since we don't pass it to DatasetParquetResponse anyway
+            )
             parquet_files.extend(config_parquet_content["parquet_files"])
+            partial = partial or config_parquet_content["partial"]
     except Exception as e:
         raise PreviousStepFormatError("Previous step did not return the expected content.", e) from e
 
     progress = (total - len(pending)) / total if total else 1.0
 
     return (
-        DatasetParquetResponse(
-            parquet_files=parquet_files,
-            pending=pending,
-            failed=failed,
-        ),
+        DatasetParquetResponse(parquet_files=parquet_files, pending=pending, failed=failed, partial=partial),
         progress,
     )
 
 
-class DatasetParquetJobRunner(JobRunner):
+class DatasetParquetJobRunner(DatasetJobRunner):
     @staticmethod
     def get_job_type() -> str:
         return "dataset-parquet"
@@ -138,14 +110,5 @@ class DatasetParquetJobRunner(JobRunner):
         return PROCESSING_STEP_DATASET_PARQUET_VERSION
 
     def compute(self) -> JobResult:
-        if self.dataset is None:
-            raise ParameterMissingError("'dataset' parameter is required")
-        response_content, progress = compute_sizes_response(dataset=self.dataset)
+        response_content, progress = compute_parquet_response(dataset=self.dataset)
         return JobResult(response_content, progress=progress)
-
-    def get_new_splits(self, content: Mapping[str, Any]) -> set[SplitFullName]:
-        """Get the set of new splits, from the content created by the compute."""
-        return {
-            SplitFullName(dataset=parquet_file["dataset"], config=parquet_file["config"], split=parquet_file["split"])
-            for parquet_file in content["parquet_files"]
-        }

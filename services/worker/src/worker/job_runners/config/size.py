@@ -2,73 +2,13 @@
 # Copyright 2022 The HuggingFace Authors.
 
 import logging
-from http import HTTPStatus
-from typing import Any, Literal, Mapping, Optional, TypedDict
 
 from libcommon.constants import PROCESSING_STEP_CONFIG_SIZE_VERSION
-from libcommon.simple_cache import SplitFullName
+from libcommon.exceptions import PreviousStepFormatError
+from libcommon.simple_cache import get_previous_step_or_raise
 
-from worker.job_runner import (
-    CompleteJobResult,
-    JobRunner,
-    JobRunnerError,
-    ParameterMissingError,
-    get_previous_step_or_raise,
-)
-
-ConfigSizeJobRunnerErrorCode = Literal["PreviousStepFormatError"]
-
-
-class ConfigSize(TypedDict):
-    dataset: str
-    config: str
-    num_bytes_original_files: int
-    num_bytes_parquet_files: int
-    num_bytes_memory: int
-    num_rows: int
-    num_columns: int
-
-
-class SplitSize(TypedDict):
-    dataset: str
-    config: str
-    split: str
-    num_bytes_parquet_files: int
-    num_bytes_memory: int
-    num_rows: int
-    num_columns: int
-
-
-class ConfigSizeContent(TypedDict):
-    config: ConfigSize
-    splits: list[SplitSize]
-
-
-class ConfigSizeResponse(TypedDict):
-    size: ConfigSizeContent
-
-
-class ConfigSizeJobRunnerError(JobRunnerError):
-    """Base class for exceptions in this module."""
-
-    def __init__(
-        self,
-        message: str,
-        status_code: HTTPStatus,
-        code: ConfigSizeJobRunnerErrorCode,
-        cause: Optional[BaseException] = None,
-        disclose_cause: bool = False,
-    ):
-        super().__init__(
-            message=message, status_code=status_code, code=code, cause=cause, disclose_cause=disclose_cause
-        )
-
-
-class PreviousStepFormatError(ConfigSizeJobRunnerError):
-    """Raised when the content of the previous step has not the expected format."""
-
-    def __init__(self, message: str, cause: Optional[BaseException] = None):
-        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "PreviousStepFormatError", cause, False)
+from worker.dtos import CompleteJobResult, ConfigSize, ConfigSizeResponse, SplitSize
+from worker.job_runners.config.config_job_runner import ConfigJobRunner
 
 
 def compute_config_size_response(dataset: str, config: str) -> ConfigSizeResponse:
@@ -82,13 +22,11 @@ def compute_config_size_response(dataset: str, config: str) -> ConfigSizeRespons
             A configuration name.
     Returns:
         `ConfigSizeResponse`: An object with the size_response.
-    <Tip>
     Raises the following errors:
-        - [`~job_runner.PreviousStepError`]
-            If the previous step gave an error.
-        - [`~job_runners.config.size.PreviousStepFormatError`]
-            If the content of the previous step has not the expected format
-    </Tip>
+        - [`libcommon.simple_cache.CachedArtifactError`]
+          If the previous step gave an error.
+        - [`libcommon.exceptions.PreviousStepFormatError`]
+          If the content of the previous step has not the expected format
     """
     logging.info(f"get size for dataset={dataset}, config={config}")
 
@@ -127,7 +65,7 @@ def compute_config_size_response(dataset: str, config: str) -> ConfigSizeRespons
             {
                 "dataset": dataset,
                 "config": config,
-                "num_bytes_original_files": config_info["download_size"],
+                "num_bytes_original_files": config_info.get("download_size"),
                 "num_bytes_parquet_files": sum(split_size["num_bytes_parquet_files"] for split_size in split_sizes),
                 "num_bytes_memory": sum(
                     split_size["num_bytes_memory"] for split_size in split_sizes
@@ -136,6 +74,7 @@ def compute_config_size_response(dataset: str, config: str) -> ConfigSizeRespons
                 "num_columns": num_columns,
             }
         )
+        partial = content["partial"]
     except Exception as e:
         raise PreviousStepFormatError("Previous step did not return the expected content.", e) from e
 
@@ -144,12 +83,13 @@ def compute_config_size_response(dataset: str, config: str) -> ConfigSizeRespons
             "size": {
                 "config": config_size,
                 "splits": split_sizes,
-            }
+            },
+            "partial": partial,
         }
     )
 
 
-class ConfigSizeJobRunner(JobRunner):
+class ConfigSizeJobRunner(ConfigJobRunner):
     @staticmethod
     def get_job_type() -> str:
         return "config-size"
@@ -159,15 +99,4 @@ class ConfigSizeJobRunner(JobRunner):
         return PROCESSING_STEP_CONFIG_SIZE_VERSION
 
     def compute(self) -> CompleteJobResult:
-        if self.dataset is None:
-            raise ParameterMissingError("'dataset' parameter is required")
-        if self.config is None:
-            raise ParameterMissingError("'config' parameter is required")
         return CompleteJobResult(compute_config_size_response(dataset=self.dataset, config=self.config))
-
-    def get_new_splits(self, content: Mapping[str, Any]) -> set[SplitFullName]:
-        """Get the set of new splits, from the content created by the compute."""
-        return {
-            SplitFullName(dataset=split_size["dataset"], config=split_size["config"], split=split_size["split"])
-            for split_size in content["size"]["splits"]
-        }

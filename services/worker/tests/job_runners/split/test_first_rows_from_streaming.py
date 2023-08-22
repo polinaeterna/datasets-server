@@ -4,17 +4,15 @@
 from dataclasses import replace
 from http import HTTPStatus
 from typing import Callable
-from unittest.mock import Mock
 
 import pytest
 from datasets.packaged_modules import csv
-from libcommon.constants import PROCESSING_STEP_SPLIT_FIRST_ROWS_FROM_PARQUET_VERSION
 from libcommon.exceptions import CustomError
-from libcommon.processing_graph import ProcessingStep
-from libcommon.queue import Priority
+from libcommon.processing_graph import ProcessingGraph
 from libcommon.resources import CacheMongoResource, QueueMongoResource
-from libcommon.simple_cache import DoesNotExist, get_response, upsert_response
+from libcommon.simple_cache import upsert_response
 from libcommon.storage import StrPath
+from libcommon.utils import Priority
 
 from worker.config import AppConfig
 from worker.job_runners.split.first_rows_from_streaming import (
@@ -23,9 +21,9 @@ from worker.job_runners.split.first_rows_from_streaming import (
 from worker.resources import LibrariesResource
 from worker.utils import get_json_size
 
-from ...fixtures.hub import HubDatasets, get_default_config_split
+from ...fixtures.hub import HubDatasetTest, get_default_config_split
 
-GetJobRunner = Callable[[str, str, str, AppConfig, bool], SplitFirstRowsFromStreamingJobRunner]
+GetJobRunner = Callable[[str, str, str, AppConfig], SplitFirstRowsFromStreamingJobRunner]
 
 
 @pytest.fixture
@@ -40,29 +38,34 @@ def get_job_runner(
         config: str,
         split: str,
         app_config: AppConfig,
-        force: bool = False,
     ) -> SplitFirstRowsFromStreamingJobRunner:
+        processing_step_name = SplitFirstRowsFromStreamingJobRunner.get_job_type()
+        processing_graph = ProcessingGraph(
+            {
+                "dataset-level": {"input_type": "dataset"},
+                "config-level": {"input_type": "dataset", "triggered_by": "dataset-level"},
+                processing_step_name: {
+                    "input_type": "dataset",
+                    "job_runner_version": SplitFirstRowsFromStreamingJobRunner.get_job_runner_version(),
+                    "triggered_by": "config-level",
+                },
+            }
+        )
         return SplitFirstRowsFromStreamingJobRunner(
             job_info={
                 "type": SplitFirstRowsFromStreamingJobRunner.get_job_type(),
-                "dataset": dataset,
-                "config": config,
-                "split": split,
+                "params": {
+                    "dataset": dataset,
+                    "revision": "revision",
+                    "config": config,
+                    "split": split,
+                },
                 "job_id": "job_id",
-                "force": force,
                 "priority": Priority.NORMAL,
+                "difficulty": 50,
             },
             app_config=app_config,
-            processing_step=ProcessingStep(
-                name=SplitFirstRowsFromStreamingJobRunner.get_job_type(),
-                input_type="split",
-                requires=[],
-                required_by_dataset_viewer=True,
-                ancestors=[],
-                children=[],
-                parents=[],
-                job_runner_version=SplitFirstRowsFromStreamingJobRunner.get_job_runner_version(),
-            ),
+            processing_step=processing_graph.get_processing_step(processing_step_name),
             hf_datasets_cache=libraries_resource.hf_datasets_cache,
             assets_directory=assets_directory,
         )
@@ -70,43 +73,21 @@ def get_job_runner(
     return _get_job_runner
 
 
-def test_should_skip_job(app_config: AppConfig, get_job_runner: GetJobRunner, hub_public_csv: str) -> None:
-    dataset, config, split = get_default_config_split(hub_public_csv)
-    job_runner = get_job_runner(dataset, config, split, app_config, False)
-    assert not job_runner.should_skip_job()
-    # we add an entry to the cache
-    upsert_response(
-        kind="/split-names-from-streaming",
-        dataset=dataset,
-        config=config,
-        content={"splits": [{"dataset": dataset, "config": config, "split": split}]},
-        http_status=HTTPStatus.OK,
-    )
-    job_runner.process()
-    assert job_runner.should_skip_job()
-    job_runner = get_job_runner(dataset, config, split, app_config, True)
-    assert not job_runner.should_skip_job()
-
-
 def test_compute(app_config: AppConfig, get_job_runner: GetJobRunner, hub_public_csv: str) -> None:
-    dataset, config, split = get_default_config_split(hub_public_csv)
-    job_runner = get_job_runner(dataset, config, split, app_config, False)
+    dataset = hub_public_csv
+    config, split = get_default_config_split()
+    job_runner = get_job_runner(dataset, config, split, app_config)
     upsert_response(
-        kind="/split-names-from-streaming",
+        kind="config-split-names-from-streaming",
         dataset=dataset,
         config=config,
         content={"splits": [{"dataset": dataset, "config": config, "split": split}]},
         http_status=HTTPStatus.OK,
     )
-    assert job_runner.process()
-    cached_response = get_response(
-        kind=job_runner.processing_step.cache_kind, dataset=dataset, config=config, split=split
-    )
-    assert cached_response["http_status"] == HTTPStatus.OK
-    assert cached_response["error_code"] is None
-    assert cached_response["job_runner_version"] == job_runner.get_job_runner_version()
-    assert cached_response["dataset_git_revision"] is not None
-    content = cached_response["content"]
+    response = job_runner.compute()
+    assert response
+    content = response.content
+    assert content
     assert content["features"][0]["feature_idx"] == 0
     assert content["features"][0]["name"] == "col_1"
     assert content["features"][0]["type"]["_type"] == "Value"
@@ -115,17 +96,8 @@ def test_compute(app_config: AppConfig, get_job_runner: GetJobRunner, hub_public
     assert content["features"][2]["type"]["dtype"] == "float64"  # <-|
 
 
-def test_doesnotexist(app_config: AppConfig, get_job_runner: GetJobRunner) -> None:
-    dataset = "doesnotexist"
-    dataset, config, split = get_default_config_split(dataset)
-    job_runner = get_job_runner(dataset, config, split, app_config, False)
-    assert not job_runner.process()
-    with pytest.raises(DoesNotExist):
-        get_response(kind=job_runner.processing_step.cache_kind, dataset=dataset, config=config, split=split)
-
-
 @pytest.mark.parametrize(
-    "name,use_token,error_code,cause",
+    "name,use_token,exception_name,cause",
     [
         ("public", False, None, None),
         ("audio", False, None, None),
@@ -134,7 +106,7 @@ def test_doesnotexist(app_config: AppConfig, get_job_runner: GetJobRunner) -> No
         ("jsonl", False, None, None),
         ("gated", True, None, None),
         ("private", True, None, None),
-        ("does_not_exist_config", False, "CachedResponseNotFound", None),
+        ("does_not_exist_config", False, "CachedArtifactError", None),
         # should we really test the following cases?
         # The assumption is that the dataset exists and is accessible with the token
         ("does_not_exist_split", False, "SplitNotFoundError", None),
@@ -143,11 +115,20 @@ def test_doesnotexist(app_config: AppConfig, get_job_runner: GetJobRunner) -> No
     ],
 )
 def test_number_rows(
-    hub_datasets: HubDatasets,
+    hub_responses_public: HubDatasetTest,
+    hub_responses_audio: HubDatasetTest,
+    hub_responses_image: HubDatasetTest,
+    hub_responses_images_list: HubDatasetTest,
+    hub_reponses_jsonl: HubDatasetTest,
+    hub_responses_gated: HubDatasetTest,
+    hub_responses_private: HubDatasetTest,
+    hub_responses_empty: HubDatasetTest,
+    hub_responses_does_not_exist_config: HubDatasetTest,
+    hub_responses_does_not_exist_split: HubDatasetTest,
     get_job_runner: GetJobRunner,
     name: str,
     use_token: bool,
-    error_code: str,
+    exception_name: str,
     cause: str,
     app_config: AppConfig,
 ) -> None:
@@ -157,21 +138,31 @@ def test_number_rows(
     if hasattr(csv, "_patched_for_streaming") and csv._patched_for_streaming:
         csv._patched_for_streaming = False
 
+    hub_datasets = {
+        "public": hub_responses_public,
+        "audio": hub_responses_audio,
+        "image": hub_responses_image,
+        "images_list": hub_responses_images_list,
+        "jsonl": hub_reponses_jsonl,
+        "gated": hub_responses_gated,
+        "private": hub_responses_private,
+        "empty": hub_responses_empty,
+        "does_not_exist_config": hub_responses_does_not_exist_config,
+        "does_not_exist_split": hub_responses_does_not_exist_split,
+    }
     dataset = hub_datasets[name]["name"]
     expected_first_rows_response = hub_datasets[name]["first_rows_response"]
-    dataset, config, split = get_default_config_split(dataset)
+    config, split = get_default_config_split()
     job_runner = get_job_runner(
         dataset,
         config,
         split,
         app_config if use_token else replace(app_config, common=replace(app_config.common, hf_token=None)),
-        False,
     )
-    job_runner.get_dataset_git_revision = Mock(return_value="1.0.0")  # type: ignore
 
-    if error_code is None:
+    if exception_name is None:
         upsert_response(
-            kind="/split-names-from-streaming",
+            kind="config-split-names-from-streaming",
             dataset=dataset,
             config=config,
             content={"splits": [{"dataset": dataset, "config": config, "split": split}]},
@@ -180,35 +171,26 @@ def test_number_rows(
         result = job_runner.compute().content
         assert result == expected_first_rows_response
         return
-    elif error_code == "SplitNotFoundError":
+    elif exception_name == "SplitNotFoundError":
         upsert_response(
-            kind="/split-names-from-streaming",
+            kind="config-split-names-from-streaming",
             dataset=dataset,
             config=config,
             content={"splits": [{"dataset": dataset, "config": config, "split": "other_split"}]},
             http_status=HTTPStatus.OK,
         )
-    elif error_code in {"InfoError", "SplitsNamesError"}:
+    elif exception_name in {"InfoError", "SplitsNamesError"}:
         upsert_response(
-            kind="/split-names-from-streaming",
+            kind="config-split-names-from-streaming",
             dataset=dataset,
             config=config,
             content={"splits": [{"dataset": dataset, "config": config, "split": split}]},
             http_status=HTTPStatus.OK,
         )
 
-    with pytest.raises(CustomError) as exc_info:
+    with pytest.raises(Exception) as exc_info:
         job_runner.compute()
-    assert exc_info.value.code == error_code
-    assert exc_info.value.cause_exception == cause
-    if exc_info.value.disclose_cause:
-        response = exc_info.value.as_response()
-        assert set(response.keys()) == {"error", "cause_exception", "cause_message", "cause_traceback"}
-        response_dict = dict(response)
-        # ^ to remove mypy warnings
-        assert response_dict["cause_exception"] == cause
-        assert isinstance(response_dict["cause_traceback"], list)
-        assert response_dict["cause_traceback"][0] == "Traceback (most recent call last):\n"
+    assert exc_info.typename == exception_name
 
 
 @pytest.mark.parametrize(
@@ -225,7 +207,8 @@ def test_number_rows(
     ],
 )
 def test_truncation(
-    hub_datasets: HubDatasets,
+    hub_public_csv: str,
+    hub_public_big: str,
     get_job_runner: GetJobRunner,
     app_config: AppConfig,
     name: str,
@@ -233,7 +216,8 @@ def test_truncation(
     columns_max_number: int,
     error_code: str,
 ) -> None:
-    dataset, config, split = get_default_config_split(hub_datasets[name]["name"])
+    dataset = hub_public_csv if name == "public" else hub_public_big
+    config, split = get_default_config_split()
     job_runner = get_job_runner(
         dataset,
         config,
@@ -250,18 +234,15 @@ def test_truncation(
                 columns_max_number=columns_max_number,
             ),
         ),
-        False,
     )
 
     upsert_response(
-        kind="/split-names-from-streaming",
+        kind="config-split-names-from-streaming",
         dataset=dataset,
         config=config,
         content={"splits": [{"dataset": dataset, "config": config, "split": split}]},
         http_status=HTTPStatus.OK,
     )
-
-    job_runner.get_dataset_git_revision = Mock(return_value="1.0.0")  # type: ignore
 
     if error_code:
         with pytest.raises(CustomError) as error_info:
@@ -270,48 +251,3 @@ def test_truncation(
     else:
         response = job_runner.compute().content
         assert get_json_size(response) <= rows_max_bytes
-
-
-@pytest.mark.parametrize(
-    "streaming_response_status,dataset_git_revision,error_code,status_code",
-    [
-        (HTTPStatus.OK, "CURRENT_GIT_REVISION", "ResponseAlreadyComputedError", HTTPStatus.INTERNAL_SERVER_ERROR),
-        (HTTPStatus.INTERNAL_SERVER_ERROR, "CURRENT_GIT_REVISION", "CachedResponseNotFound", HTTPStatus.NOT_FOUND),
-        (HTTPStatus.OK, "DIFFERENT_GIT_REVISION", "CachedResponseNotFound", HTTPStatus.NOT_FOUND),
-    ],
-)
-def test_response_already_computed(
-    app_config: AppConfig,
-    get_job_runner: GetJobRunner,
-    streaming_response_status: HTTPStatus,
-    dataset_git_revision: str,
-    error_code: str,
-    status_code: HTTPStatus,
-) -> None:
-    dataset = "dataset"
-    config = "config"
-    split = "split"
-    current_dataset_git_revision = "CURRENT_GIT_REVISION"
-    upsert_response(
-        kind="split-first-rows-from-parquet",
-        dataset=dataset,
-        config=config,
-        split=split,
-        content={},
-        dataset_git_revision=dataset_git_revision,
-        job_runner_version=PROCESSING_STEP_SPLIT_FIRST_ROWS_FROM_PARQUET_VERSION,
-        progress=1.0,
-        http_status=streaming_response_status,
-    )
-    job_runner = get_job_runner(
-        dataset,
-        config,
-        split,
-        app_config,
-        False,
-    )
-    job_runner.get_dataset_git_revision = Mock(return_value=current_dataset_git_revision)  # type: ignore
-    with pytest.raises(CustomError) as exc_info:
-        job_runner.compute()
-    assert exc_info.value.status_code == status_code
-    assert exc_info.value.code == error_code

@@ -2,10 +2,13 @@
 # Copyright 2022 The HuggingFace Authors.
 
 import uvicorn
+from libapi.config import UvicornConfig
+from libapi.jwt_token import get_jwt_public_keys
+from libapi.routes.healthcheck import healthcheck_endpoint
+from libapi.routes.metrics import create_metrics_endpoint
 from libcommon.log import init_logging
 from libcommon.processing_graph import ProcessingGraph
 from libcommon.resources import CacheMongoResource, QueueMongoResource, Resource
-from libcommon.storage import exists, init_cached_assets_dir
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -13,13 +16,9 @@ from starlette.middleware.gzip import GZipMiddleware
 from starlette.routing import Route
 from starlette_prometheus import PrometheusMiddleware
 
-from api.config import AppConfig, EndpointConfig, UvicornConfig
-from api.jwt_token import fetch_jwt_public_key
-from api.prometheus import Prometheus
+from api.config import AppConfig, EndpointConfig
 from api.routes.endpoint import EndpointsDefinition, create_endpoint
-from api.routes.healthcheck import healthcheck_endpoint
-from api.routes.rows import create_rows_endpoint
-from api.routes.valid import create_is_valid_endpoint, create_valid_endpoint
+from api.routes.valid import create_valid_endpoint
 from api.routes.webhook import create_webhook_endpoint
 
 
@@ -32,29 +31,15 @@ def create_app() -> Starlette:
 def create_app_with_config(app_config: AppConfig, endpoint_config: EndpointConfig) -> Starlette:
     init_logging(level=app_config.log.level)
     # ^ set first to have logs as soon as possible
-    cached_assets_directory = init_cached_assets_dir(directory=app_config.cached_assets.storage_directory)
-    if not exists(cached_assets_directory):
-        raise RuntimeError("The assets storage directory could not be accessed. Exiting.")
-
-    prometheus = Prometheus()
 
     processing_graph = ProcessingGraph(app_config.processing_graph.specification)
     endpoints_definition = EndpointsDefinition(processing_graph, endpoint_config)
-    processing_steps_required_by_dataset_viewer = processing_graph.get_steps_required_by_dataset_viewer()
-    init_processing_steps = processing_graph.get_first_steps()
-    hf_jwt_public_key = (
-        fetch_jwt_public_key(
-            url=app_config.api.hf_jwt_public_key_url,
-            hf_jwt_algorithm=app_config.api.hf_jwt_algorithm,
-            hf_timeout_seconds=app_config.api.hf_timeout_seconds,
-        )
-        if app_config.api.hf_jwt_public_key_url and app_config.api.hf_jwt_algorithm
-        else None
+    hf_jwt_public_keys = get_jwt_public_keys(
+        algorithm_name=app_config.api.hf_jwt_algorithm,
+        public_key_url=app_config.api.hf_jwt_public_key_url,
+        additional_public_keys=app_config.api.hf_jwt_additional_public_keys,
+        timeout_seconds=app_config.api.hf_timeout_seconds,
     )
-    parquet_processing_steps_by_input_type = endpoints_definition.steps_by_input_type_and_endpoint.get("/parquet")
-    if not parquet_processing_steps_by_input_type or not parquet_processing_steps_by_input_type["config"]:
-        raise RuntimeError("The parquet endpoint is not configured. Exiting.")
-    config_parquet_processing_steps = parquet_processing_steps_by_input_type["config"]
 
     middleware = [
         Middleware(
@@ -78,15 +63,16 @@ def create_app_with_config(app_config: AppConfig, endpoint_config: EndpointConfi
             endpoint=create_endpoint(
                 endpoint_name=endpoint_name,
                 steps_by_input_type=steps_by_input_type,
-                init_processing_steps=init_processing_steps,
+                processing_graph=processing_graph,
                 hf_endpoint=app_config.common.hf_endpoint,
                 hf_token=app_config.common.hf_token,
-                hf_jwt_public_key=hf_jwt_public_key,
+                hf_jwt_public_keys=hf_jwt_public_keys,
                 hf_jwt_algorithm=app_config.api.hf_jwt_algorithm,
                 external_auth_url=app_config.api.external_auth_url,
                 hf_timeout_seconds=app_config.api.hf_timeout_seconds,
                 max_age_long=app_config.api.max_age_long,
                 max_age_short=app_config.api.max_age_short,
+                cache_max_days=app_config.cache.max_days,
             ),
         )
         for endpoint_name, steps_by_input_type in endpoints_definition.steps_by_input_type_and_endpoint.items()
@@ -94,56 +80,25 @@ def create_app_with_config(app_config: AppConfig, endpoint_config: EndpointConfi
         Route(
             "/valid",
             endpoint=create_valid_endpoint(
-                processing_steps_for_valid=processing_steps_required_by_dataset_viewer,
-                max_age_long=app_config.api.max_age_long,
-                max_age_short=app_config.api.max_age_short,
-            ),
-        ),
-        Route(
-            "/is-valid",
-            endpoint=create_is_valid_endpoint(
-                hf_jwt_public_key=hf_jwt_public_key,
-                hf_jwt_algorithm=app_config.api.hf_jwt_algorithm,
-                external_auth_url=app_config.api.external_auth_url,
-                hf_timeout_seconds=app_config.api.hf_timeout_seconds,
-                processing_steps_for_valid=processing_steps_required_by_dataset_viewer,
+                processing_graph=processing_graph,
                 max_age_long=app_config.api.max_age_long,
                 max_age_short=app_config.api.max_age_short,
             ),
         ),
         # ^ called by https://github.com/huggingface/model-evaluator
         Route("/healthcheck", endpoint=healthcheck_endpoint),
-        Route("/metrics", endpoint=prometheus.endpoint),
+        Route("/metrics", endpoint=create_metrics_endpoint()),
         # ^ called by Prometheus
         Route(
             "/webhook",
             endpoint=create_webhook_endpoint(
-                init_processing_steps=init_processing_steps,
-                hf_endpoint=app_config.common.hf_endpoint,
-                hf_token=app_config.common.hf_token,
+                processing_graph=processing_graph,
                 hf_webhook_secret=app_config.api.hf_webhook_secret,
-                hf_timeout_seconds=app_config.api.hf_timeout_seconds,
+                cache_max_days=app_config.cache.max_days,
             ),
             methods=["POST"],
         ),
         # ^ called by the Hub webhooks
-        Route(
-            "/rows",
-            endpoint=create_rows_endpoint(
-                config_parquet_processing_steps=config_parquet_processing_steps,
-                init_processing_steps=init_processing_steps,
-                cached_assets_base_url=app_config.cached_assets.base_url,
-                cached_assets_directory=cached_assets_directory,
-                hf_endpoint=app_config.common.hf_endpoint,
-                hf_token=app_config.common.hf_token,
-                hf_jwt_public_key=hf_jwt_public_key,
-                hf_jwt_algorithm=app_config.api.hf_jwt_algorithm,
-                external_auth_url=app_config.api.external_auth_url,
-                hf_timeout_seconds=app_config.api.hf_timeout_seconds,
-                max_age_long=app_config.api.max_age_long,
-                max_age_short=app_config.api.max_age_short,
-            ),
-        ),
     ]
 
     return Starlette(routes=routes, middleware=middleware, on_shutdown=[resource.release for resource in resources])

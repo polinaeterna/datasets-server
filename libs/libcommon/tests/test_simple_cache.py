@@ -4,33 +4,39 @@
 from datetime import datetime
 from http import HTTPStatus
 from time import process_time
-from typing import Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Mapping, Optional, TypedDict
 
 import pytest
 from pymongo.errors import DocumentTooLarge
 
 from libcommon.resources import CacheMongoResource
 from libcommon.simple_cache import (
-    CachedResponse,
+    CachedArtifactError,
+    CachedResponseDocument,
+    CacheEntryDoesNotExistError,
     CacheReportsPage,
     CacheReportsWithContentPage,
-    DoesNotExist,
+    CacheTotalMetricDocument,
     InvalidCursor,
     InvalidLimit,
     delete_dataset_responses,
     delete_response,
+    fetch_names,
     get_best_response,
     get_cache_reports,
     get_cache_reports_with_content,
     get_dataset_responses_without_content_for_kind,
     get_outdated_split_full_names_for_step,
     get_response,
+    get_response_with_details,
     get_response_without_content,
     get_responses_count_by_kind_status_and_error_code,
     get_valid_datasets,
-    get_validity_by_kind,
+    has_any_successful_response,
     upsert_response,
 )
+
+from .utils import CONFIG_NAME_1, CONTENT_ERROR, DATASET_NAME
 
 
 @pytest.fixture(autouse=True)
@@ -48,27 +54,27 @@ def test_insert_null_values() -> None:
     content = {"some": "content"}
     http_status = HTTPStatus.OK
 
-    CachedResponse.objects(kind=kind, dataset=dataset_a, config=config, split=split).upsert_one(
+    CachedResponseDocument.objects(kind=kind, dataset=dataset_a, config=config, split=split).upsert_one(
         content=content,
         http_status=http_status,
     )
-    assert CachedResponse.objects.count() == 1
-    cached_response = CachedResponse.objects.get()
+    assert CachedResponseDocument.objects.count() == 1
+    cached_response = CachedResponseDocument.objects.get()
     assert cached_response is not None
     assert cached_response.config is None
     assert "config" not in cached_response.to_json()
     cached_response.validate()
 
-    CachedResponse(
+    CachedResponseDocument(
         kind=kind, dataset=dataset_b, config=config, split=split, content=content, http_status=http_status
     ).save()
-    assert CachedResponse.objects.count() == 2
-    cached_response = CachedResponse.objects(dataset=dataset_b).get()
+    assert CachedResponseDocument.objects.count() == 2
+    cached_response = CachedResponseDocument.objects(dataset=dataset_b).get()
     assert cached_response is not None
     assert cached_response.config is None
     assert "config" not in cached_response.to_json()
 
-    coll = CachedResponse._get_collection()
+    coll = CachedResponseDocument._get_collection()
     coll.insert_one(
         {
             "kind": kind,
@@ -79,11 +85,17 @@ def test_insert_null_values() -> None:
             "http_status": http_status,
         }
     )
-    assert CachedResponse.objects.count() == 3
-    cached_response = CachedResponse.objects(dataset=dataset_c).get()
+    assert CachedResponseDocument.objects.count() == 3
+    cached_response = CachedResponseDocument.objects(dataset=dataset_c).get()
     assert cached_response is not None
     assert cached_response.config is None
     assert "config" not in cached_response.to_json()
+
+
+def assert_metric(http_status: HTTPStatus, error_code: Optional[str], kind: str, total: int) -> None:
+    metric = CacheTotalMetricDocument.objects(http_status=http_status, error_code=error_code, kind=kind).first()
+    assert metric is not None
+    assert metric.total == total
 
 
 @pytest.mark.parametrize(
@@ -100,6 +112,8 @@ def test_upsert_response(config: Optional[str], split: Optional[str]) -> None:
     config = None
     split = None
     content = {"some": "content"}
+
+    assert CacheTotalMetricDocument.objects().count() == 0
     upsert_response(kind=kind, dataset=dataset, config=config, split=split, content=content, http_status=HTTPStatus.OK)
     cached_response = get_response(kind=kind, dataset=dataset, config=config, split=split)
     assert cached_response == {
@@ -121,10 +135,14 @@ def test_upsert_response(config: Optional[str], split: Optional[str]) -> None:
         "progress": None,
     }
 
+    assert_metric(http_status=HTTPStatus.OK, error_code=None, kind=kind, total=1)
+
     # ensure it's idempotent
     upsert_response(kind=kind, dataset=dataset, config=config, split=split, content=content, http_status=HTTPStatus.OK)
     cached_response2 = get_response(kind=kind, dataset=dataset, config=config, split=split)
     assert cached_response2 == cached_response
+
+    assert_metric(http_status=HTTPStatus.OK, error_code=None, kind=kind, total=1)
 
     another_config = "another_config"
     upsert_response(
@@ -132,8 +150,13 @@ def test_upsert_response(config: Optional[str], split: Optional[str]) -> None:
     )
     get_response(kind=kind, dataset=dataset, config=config, split=split)
 
+    assert_metric(http_status=HTTPStatus.OK, error_code=None, kind=kind, total=2)
+
     delete_dataset_responses(dataset=dataset)
-    with pytest.raises(DoesNotExist):
+
+    assert_metric(http_status=HTTPStatus.OK, error_code=None, kind=kind, total=0)
+
+    with pytest.raises(CacheEntryDoesNotExistError):
         get_response(kind=kind, dataset=dataset, config=config, split=split)
 
     error_code = "error_code"
@@ -150,6 +173,9 @@ def test_upsert_response(config: Optional[str], split: Optional[str]) -> None:
         job_runner_version=job_runner_version,
         dataset_git_revision=dataset_git_revision,
     )
+
+    assert_metric(http_status=HTTPStatus.OK, error_code=None, kind=kind, total=0)
+    assert_metric(http_status=HTTPStatus.BAD_REQUEST, error_code=error_code, kind=kind, total=1)
 
     cached_response3 = get_response(kind=kind, dataset=dataset, config=config, split=split)
     assert cached_response3 == {
@@ -170,10 +196,13 @@ def test_delete_response() -> None:
     split = "test_split"
     upsert_response(kind=kind, dataset=dataset_a, config=config, split=split, content={}, http_status=HTTPStatus.OK)
     upsert_response(kind=kind, dataset=dataset_b, config=config, split=split, content={}, http_status=HTTPStatus.OK)
+    assert_metric(http_status=HTTPStatus.OK, error_code=None, kind=kind, total=2)
+
     get_response(kind=kind, dataset=dataset_a, config=config, split=split)
     get_response(kind=kind, dataset=dataset_b, config=config, split=split)
     delete_response(kind=kind, dataset=dataset_a, config=config, split=split)
-    with pytest.raises(DoesNotExist):
+    assert_metric(http_status=HTTPStatus.OK, error_code=None, kind=kind, total=1)
+    with pytest.raises(CacheEntryDoesNotExistError):
         get_response(kind=kind, dataset=dataset_a, config=config, split=split)
     get_response(kind=kind, dataset=dataset_b, config=config, split=split)
 
@@ -188,13 +217,17 @@ def test_delete_dataset_responses() -> None:
     upsert_response(kind=kind_a, dataset=dataset_a, content={}, http_status=HTTPStatus.OK)
     upsert_response(kind=kind_b, dataset=dataset_a, config=config, split=split, content={}, http_status=HTTPStatus.OK)
     upsert_response(kind=kind_a, dataset=dataset_b, content={}, http_status=HTTPStatus.OK)
+    assert_metric(http_status=HTTPStatus.OK, error_code=None, kind=kind_a, total=2)
+    assert_metric(http_status=HTTPStatus.OK, error_code=None, kind=kind_b, total=1)
     get_response(kind=kind_a, dataset=dataset_a)
     get_response(kind=kind_b, dataset=dataset_a, config=config, split=split)
     get_response(kind=kind_a, dataset=dataset_b)
     delete_dataset_responses(dataset=dataset_a)
-    with pytest.raises(DoesNotExist):
+    assert_metric(http_status=HTTPStatus.OK, error_code=None, kind=kind_a, total=1)
+    assert_metric(http_status=HTTPStatus.OK, error_code=None, kind=kind_b, total=0)
+    with pytest.raises(CacheEntryDoesNotExistError):
         get_response(kind=kind_a, dataset=dataset_a)
-    with pytest.raises(DoesNotExist):
+    with pytest.raises(CacheEntryDoesNotExistError):
         get_response(kind=kind_b, dataset=dataset_a, config=config, split=split)
     get_response(kind=kind_a, dataset=dataset_b)
 
@@ -262,46 +295,45 @@ def test_get_valid_dataset_names_only_invalid_responses() -> None:
     assert not get_valid_datasets(kind=kind)
 
 
-def test_get_validity_by_kind_empty() -> None:
-    assert not get_validity_by_kind(dataset="dataset")
+def test_has_any_successful_response_empty() -> None:
+    assert not has_any_successful_response(dataset="dataset", kinds=[])
 
 
-def test_get_validity_by_kind_two_valid_datasets() -> None:
+def test_has_any_successful_response_two_valid_datasets() -> None:
     kind = "test_kind"
     other_kind = "other_kind"
     dataset_a = "test_dataset_a"
     dataset_b = "test_dataset_b"
     upsert_response(kind=kind, dataset=dataset_a, content={}, http_status=HTTPStatus.OK)
     upsert_response(kind=kind, dataset=dataset_b, content={}, http_status=HTTPStatus.OK)
-    assert get_validity_by_kind(dataset=dataset_a) == {kind: True}
-    assert get_validity_by_kind(dataset=dataset_b) == {kind: True}
-    assert get_validity_by_kind(dataset=dataset_b, kinds=[kind]) == {kind: True}
-    assert not get_validity_by_kind(dataset=dataset_b, kinds=[other_kind])
-    assert get_validity_by_kind(dataset=dataset_b, kinds=[kind, other_kind]) == {kind: True}
+    assert has_any_successful_response(dataset=dataset_a, kinds=[kind])
+    assert has_any_successful_response(dataset=dataset_b, kinds=[kind])
+    assert not has_any_successful_response(dataset=dataset_b, kinds=[other_kind])
+    assert has_any_successful_response(dataset=dataset_b, kinds=[kind, other_kind])
 
 
-def test_get_validity_by_kind_two_valid_kinds() -> None:
+def test_has_any_successful_response_two_valid_kinds() -> None:
     kind_a = "test_kind_a"
     kind_b = "test_kind_b"
     dataset = "test_dataset"
     upsert_response(kind=kind_a, dataset=dataset, content={}, http_status=HTTPStatus.OK)
     upsert_response(kind=kind_b, dataset=dataset, content={}, http_status=HTTPStatus.OK)
-    assert get_validity_by_kind(dataset=dataset) == {kind_a: True, kind_b: True}
+    assert has_any_successful_response(dataset=dataset, kinds=[kind_a, kind_b])
 
 
-def test_get_validity_by_kind_at_least_one_valid_response() -> None:
-    kind = "test_kind"
+def test_has_any_successful_response_at_least_one_valid_response() -> None:
+    kind_a = "test_kind_a"
+    kind_b = "test_kind_b"
     dataset = "test_dataset"
-    config_a = "test_config_a"
-    config_b = "test_config_b"
-    upsert_response(kind=kind, dataset=dataset, config=config_a, content={}, http_status=HTTPStatus.OK)
+    config = "test_config"
+    upsert_response(kind=kind_a, dataset=dataset, config=config, content={}, http_status=HTTPStatus.OK)
     upsert_response(
-        kind=kind, dataset=dataset, config=config_b, content={}, http_status=HTTPStatus.INTERNAL_SERVER_ERROR
+        kind=kind_b, dataset=dataset, config=config, content={}, http_status=HTTPStatus.INTERNAL_SERVER_ERROR
     )
-    assert get_validity_by_kind(dataset=dataset) == {kind: True}
+    assert has_any_successful_response(dataset=dataset, config=config, kinds=[kind_a, kind_b])
 
 
-def test_get_validity_by_kind_only_invalid_responses() -> None:
+def test_has_any_successful_response_only_invalid_responses() -> None:
     kind = "test_kind"
     dataset = "test_dataset"
     config_a = "test_config_a"
@@ -312,7 +344,7 @@ def test_get_validity_by_kind_only_invalid_responses() -> None:
     upsert_response(
         kind=kind, dataset=dataset, config=config_b, content={}, http_status=HTTPStatus.INTERNAL_SERVER_ERROR
     )
-    assert get_validity_by_kind(dataset=dataset) == {kind: False}
+    assert not has_any_successful_response(dataset=dataset, kinds=[kind])
 
 
 def test_count_by_status_and_error_code() -> None:
@@ -341,10 +373,10 @@ def test_count_by_status_and_error_code() -> None:
         error_code="error_code",
     )
 
-    assert get_responses_count_by_kind_status_and_error_code() == [
-        {"kind": "test_kind", "http_status": 200, "error_code": None, "count": 1},
-        {"kind": "test_kind2", "http_status": 500, "error_code": "error_code", "count": 1},
-    ]
+    metrics = get_responses_count_by_kind_status_and_error_code()
+    assert len(metrics) == 2
+    assert {"kind": "test_kind", "http_status": 200, "error_code": None, "count": 1} in metrics
+    assert {"kind": "test_kind2", "http_status": 500, "error_code": "error_code", "count": 1} in metrics
 
 
 def test_get_cache_reports() -> None:
@@ -735,3 +767,118 @@ def test_get_best_response(
     )
     assert best_response.response["http_status"] == entries[best_entry]["http_status"].value
     assert best_response.response["progress"] == entries[best_entry]["progress"]
+
+
+def test_cached_artifact_error() -> None:
+    dataset = "dataset"
+    config = "config"
+    split = "split"
+    kind = "cache_kind"
+    error_code = "ErrorCode"
+    error_message = "error message"
+    cause_exception = "CauseException"
+    cause_message = "cause message"
+    cause_traceback = ["traceback1", "traceback2"]
+    details = {
+        "error": error_message,
+        "cause_exception": cause_exception,
+        "cause_message": cause_message,
+        "cause_traceback": cause_traceback,
+    }
+    content = {"error": error_message}
+    job_runner_version = 1
+    dataset_git_revision = "dataset_git_revision"
+    progress = 1.0
+    upsert_response(
+        kind=kind,
+        dataset=dataset,
+        config=config,
+        split=split,
+        content=content,
+        http_status=HTTPStatus.INTERNAL_SERVER_ERROR,
+        error_code=error_code,
+        details=details,
+        job_runner_version=job_runner_version,
+        dataset_git_revision=dataset_git_revision,
+        progress=progress,
+    )
+    response = get_response_with_details(kind=kind, dataset=dataset, config=config, split=split)
+    error = CachedArtifactError(
+        message="Previous step error",
+        kind=kind,
+        dataset=dataset,
+        config=config,
+        split=split,
+        cache_entry_with_details=response,
+    )
+
+    assert error.cache_entry_with_details["content"] == content
+    assert error.cache_entry_with_details["http_status"] == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert error.cache_entry_with_details["error_code"] == error_code
+    assert error.enhanced_details == {
+        "error": error_message,
+        "cause_exception": cause_exception,
+        "cause_message": cause_message,
+        "cause_traceback": cause_traceback,
+        "copied_from_artifact": {
+            "kind": kind,
+            "dataset": dataset,
+            "config": config,
+            "split": split,
+        },
+    }
+
+
+class ResponseSpec(TypedDict):
+    content: Mapping[str, Any]
+    http_status: HTTPStatus
+
+
+CACHE_KIND_A = "cache_kind_a"
+CACHE_KIND_B = "cache_kind_b"
+NAMES = ["name_1", "name_2", "name_3"]
+NAME_FIELD = "name"
+NAMES_FIELD = "names"
+NAMES_RESPONSE_OK = ResponseSpec(
+    content={NAMES_FIELD: [{NAME_FIELD: name} for name in NAMES]}, http_status=HTTPStatus.OK
+)
+RESPONSE_ERROR = ResponseSpec(content=CONTENT_ERROR, http_status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+@pytest.mark.parametrize(
+    "cache_kinds,response_spec_by_kind,expected_names",
+    [
+        ([], {}, []),
+        ([CACHE_KIND_A], {}, []),
+        ([CACHE_KIND_A], {CACHE_KIND_A: RESPONSE_ERROR}, []),
+        ([CACHE_KIND_A], {CACHE_KIND_A: NAMES_RESPONSE_OK}, NAMES),
+        ([CACHE_KIND_A, CACHE_KIND_B], {CACHE_KIND_A: NAMES_RESPONSE_OK}, NAMES),
+        ([CACHE_KIND_A, CACHE_KIND_B], {CACHE_KIND_A: NAMES_RESPONSE_OK, CACHE_KIND_B: RESPONSE_ERROR}, NAMES),
+        ([CACHE_KIND_A, CACHE_KIND_B], {CACHE_KIND_A: NAMES_RESPONSE_OK, CACHE_KIND_B: NAMES_RESPONSE_OK}, NAMES),
+        ([CACHE_KIND_A, CACHE_KIND_B], {CACHE_KIND_A: RESPONSE_ERROR, CACHE_KIND_B: RESPONSE_ERROR}, []),
+    ],
+)
+def test_fetch_names(
+    cache_kinds: List[str],
+    response_spec_by_kind: Mapping[str, Mapping[str, Any]],
+    expected_names: List[str],
+) -> None:
+    for kind, response_spec in response_spec_by_kind.items():
+        upsert_response(
+            kind=kind,
+            dataset=DATASET_NAME,
+            config=CONFIG_NAME_1,
+            split=None,
+            content=response_spec["content"],
+            http_status=response_spec["http_status"],
+        )
+    assert (
+        fetch_names(
+            dataset=DATASET_NAME,
+            config=CONFIG_NAME_1,
+            cache_kinds=cache_kinds,
+            names_field=NAMES_FIELD,
+            name_field=NAME_FIELD,
+        )
+        == expected_names
+    )

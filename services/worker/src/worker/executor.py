@@ -5,16 +5,19 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
-from typing import Any, Callable, Optional
+from random import random
+from typing import Any, Callable, Optional, Tuple, Union
 
 import orjson
 from filelock import FileLock
+from libcommon.processing_graph import ProcessingGraph
 from libcommon.queue import Queue
 from libcommon.utils import get_datetime
 from mirakuru import OutputExecutor
 
 from worker import start_worker_loop
 from worker.config import AppConfig
+from worker.job_manager import JobManager
 from worker.job_runner_factory import JobRunnerFactory
 from worker.loop import WorkerState
 
@@ -22,13 +25,20 @@ START_WORKER_LOOP_PATH = start_worker_loop.__file__
 
 
 async def every(
-    func: Callable[..., Optional[Any]], *args: Any, seconds: int, stop_on: Optional[Any] = None, **kwargs: Any
+    func: Callable[..., Optional[Any]],
+    *args: Any,
+    seconds: Union[float, Tuple[float, float]],
+    stop_on: Optional[Any] = None,
+    **kwargs: Any,
 ) -> None:
     while True:
         out = func(*args, **kwargs)
         if stop_on is not None and out == stop_on:
             break
-        await asyncio.sleep(seconds)
+        delay = (
+            seconds[0] + (seconds[1] - seconds[0]) * random() if isinstance(seconds, tuple) else seconds  # nosec B311
+        )
+        await asyncio.sleep(delay)
 
 
 class BadWorkerState(RuntimeError):
@@ -42,10 +52,16 @@ class WorkerExecutor:
         self.app_config = app_config
         self.job_runner_factory = job_runner_factory
         self.state_file_path = state_file_path
+        self.processing_graph = ProcessingGraph(self.app_config.processing_graph.specification)
 
         max_missing_heartbeats = self.app_config.worker.max_missing_heartbeats
         heartbeat_interval_seconds = self.app_config.worker.heartbeat_interval_seconds
         self.max_seconds_without_heartbeat_for_zombies = heartbeat_interval_seconds * max_missing_heartbeats
+
+        self.heartbeat_interval_seconds = self.app_config.worker.heartbeat_interval_seconds
+        self.max_job_duration_seconds = self.app_config.worker.max_job_duration_seconds
+        self.kill_zombies_interval_seconds = self.app_config.worker.kill_zombies_interval_seconds
+        self.kill_long_job_interval_seconds = self.app_config.worker.kill_long_job_interval_seconds
 
     def _create_worker_loop_executor(self) -> OutputExecutor:
         banner = self.state_file_path
@@ -74,17 +90,28 @@ class WorkerExecutor:
         loop = asyncio.get_event_loop()
         loop.set_exception_handler(custom_exception_handler)
         logging.info("Starting heartbeat.")
-        loop.create_task(every(self.heartbeat, seconds=self.app_config.worker.heartbeat_interval_seconds))
-        loop.create_task(every(self.kill_zombies, seconds=self.app_config.worker.kill_zombies_interval_seconds))
+        loop.create_task(every(self.heartbeat, seconds=self.heartbeat_interval_seconds))
+        loop.create_task(
+            every(
+                self.kill_zombies,
+                seconds=(
+                    self.kill_zombies_interval_seconds * 0.5,
+                    self.kill_zombies_interval_seconds * 1.5,
+                ),
+            )
+        )
         loop.create_task(
             every(
                 self.kill_long_job,
                 worker_loop_executor=worker_loop_executor,
-                seconds=self.app_config.worker.kill_long_job_interval_seconds,
+                seconds=(
+                    self.kill_long_job_interval_seconds * 0.5,
+                    self.kill_long_job_interval_seconds * 1.5,
+                ),
             )
         )
         loop.run_until_complete(
-            every(self.is_worker_alive, worker_loop_executor=worker_loop_executor, seconds=1, stop_on=False)
+            every(self.is_worker_alive, worker_loop_executor=worker_loop_executor, seconds=1.0, stop_on=False)
         )
         if exceptions:
             raise RuntimeError(f"Some async tasks failed: {exceptions}")
@@ -112,34 +139,46 @@ class WorkerExecutor:
     def kill_zombies(self) -> None:
         queue = Queue()
         zombies = queue.get_zombies(max_seconds_without_heartbeat=self.max_seconds_without_heartbeat_for_zombies)
-        queue.kill_zombies(zombies)
-        message = "Job runner crashed while running this job (missing heartbeats)."
+        message = "Job manager crashed while running this job (missing heartbeats)."
         for zombie in zombies:
             job_runner = self.job_runner_factory.create_job_runner(zombie)
-            job_runner.set_crashed(message=message)
+            job_manager = JobManager(
+                job_info=zombie,
+                app_config=self.app_config,
+                job_runner=job_runner,
+                processing_graph=self.processing_graph,
+            )
+            job_manager.set_crashed(message=message)
+            logging.info(f"Killing zombie. Job info = {zombie}")
 
     def kill_long_job(self, worker_loop_executor: OutputExecutor) -> None:
         worker_state = self.get_state()
         if worker_state and worker_state["current_job_info"]:
             long_job = worker_state["current_job_info"]
             last_updated = worker_state["last_updated"]
-            if last_updated + timedelta(seconds=self.app_config.worker.max_job_duration_seconds) <= get_datetime():
+            coefficient = 10 if long_job["params"]["dataset"] == "cerebras/SlimPajama-627B" else 1
+            if last_updated + timedelta(seconds=coefficient * self.max_job_duration_seconds) <= get_datetime():
                 _duration_seconds = int((get_datetime() - last_updated).total_seconds())
                 logging.warning(
                     f"Job {long_job} exceeded maximum duration of"
-                    f" {self.app_config.worker.max_job_duration_seconds} seconds ({_duration_seconds} seconds)."
+                    f" {self.max_job_duration_seconds} seconds ({_duration_seconds} seconds)."
                 )
                 try:
                     worker_loop_executor.stop()  # raises an error if the worker returned exit code 1
                 finally:
-                    Queue().kill_long_job(long_job)
+                    logging.info(f"Killing a long job. Job info = {long_job}")
                     job_runner = self.job_runner_factory.create_job_runner(long_job)
-                    message = "Job runner was killed while running this job (job exceeded maximum duration)."
-                    job_runner.set_exceeded_maximum_duration(message=message)
+                    job_manager = JobManager(
+                        job_info=long_job,
+                        app_config=self.app_config,
+                        job_runner=job_runner,
+                        processing_graph=self.processing_graph,
+                    )
+                    message = "Job manager was killed while running this job (job exceeded maximum duration)."
+                    job_manager.set_exceeded_maximum_duration(message=message)
 
     def is_worker_alive(self, worker_loop_executor: OutputExecutor) -> bool:
-        if not worker_loop_executor.running():
-            worker_loop_executor.stop()  # raises an error if the worker returned exit code 1
-            return False
-        else:
+        if worker_loop_executor.running():
             return True
+        worker_loop_executor.stop()  # raises an error if the worker returned exit code 1
+        return False

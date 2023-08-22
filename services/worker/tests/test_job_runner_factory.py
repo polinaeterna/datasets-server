@@ -5,8 +5,8 @@ from typing import Optional
 
 import pytest
 from libcommon.processing_graph import ProcessingGraph
-from libcommon.queue import JobInfo, Priority
 from libcommon.storage import StrPath
+from libcommon.utils import JobInfo, Priority
 
 from worker.config import AppConfig
 from worker.job_runner_factory import JobRunnerFactory
@@ -21,7 +21,7 @@ def processing_graph(app_config: AppConfig) -> ProcessingGraph:
 @pytest.mark.parametrize(
     "job_type,expected_job_runner",
     [
-        ("/config-names", "ConfigNamesJobRunner"),
+        ("dataset-config-names", "DatasetConfigNamesJobRunner"),
         ("split-first-rows-from-streaming", "SplitFirstRowsFromStreamingJobRunner"),
         ("config-parquet-and-info", "ConfigParquetAndInfoJobRunner"),
         ("config-parquet", "ConfigParquetJobRunner"),
@@ -38,6 +38,9 @@ def test_create_job_runner(
     processing_graph: ProcessingGraph,
     libraries_resource: LibrariesResource,
     assets_directory: StrPath,
+    parquet_metadata_directory: StrPath,
+    duckdb_index_cache_directory: StrPath,
+    statistics_cache_directory: StrPath,
     job_type: str,
     expected_job_runner: Optional[str],
 ) -> None:
@@ -46,18 +49,24 @@ def test_create_job_runner(
         processing_graph=processing_graph,
         hf_datasets_cache=libraries_resource.hf_datasets_cache,
         assets_directory=assets_directory,
+        parquet_metadata_directory=parquet_metadata_directory,
+        duckdb_index_cache_directory=duckdb_index_cache_directory,
+        statistics_cache_directory=statistics_cache_directory,
     )
     job_info: JobInfo = {
         "type": job_type,
-        "dataset": "dataset",
-        "config": "config",
-        "split": "split",
+        "params": {
+            "dataset": "dataset",
+            "revision": "revision",
+            "config": "config",
+            "split": "split",
+        },
         "job_id": "job_id",
-        "force": False,
         "priority": Priority.NORMAL,
+        "difficulty": 50,
     }
     if expected_job_runner is None:
-        with pytest.raises(ValueError):
+        with pytest.raises(KeyError):
             factory.create_job_runner(job_info=job_info)
     else:
         job_runner = factory.create_job_runner(job_info=job_info)

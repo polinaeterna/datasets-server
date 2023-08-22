@@ -2,9 +2,9 @@
 # Copyright 2022 The HuggingFace Authors.
 
 import logging
-from typing import List, Optional
+from typing import Optional
 
-from libcommon.processing_graph import ProcessingStep
+from libcommon.processing_graph import ProcessingGraph
 from libcommon.queue import Queue
 from starlette.requests import Request
 from starlette.responses import Response
@@ -20,21 +20,27 @@ from admin.utils import (
 
 
 def create_pending_jobs_endpoint(
-    processing_steps: List[ProcessingStep],
+    processing_graph: ProcessingGraph,
     max_age: int,
     external_auth_url: Optional[str] = None,
     organization: Optional[str] = None,
+    hf_timeout_seconds: Optional[float] = None,
 ) -> Endpoint:
     async def pending_jobs_endpoint(request: Request) -> Response:
         logging.info("/pending-jobs")
         try:
             # if auth_check fails, it will raise an exception that will be caught below
-            auth_check(external_auth_url=external_auth_url, request=request, organization=organization)
+            auth_check(
+                external_auth_url=external_auth_url,
+                request=request,
+                organization=organization,
+                hf_timeout_seconds=hf_timeout_seconds,
+            )
             queue = Queue()
             return get_json_ok_response(
                 {
                     processing_step.job_type: queue.get_dump_by_pending_status(job_type=processing_step.job_type)
-                    for processing_step in processing_steps
+                    for processing_step in processing_graph.get_alphabetically_ordered_processing_steps()
                 },
                 max_age=max_age,
             )

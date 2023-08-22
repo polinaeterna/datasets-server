@@ -2,26 +2,50 @@
 # Copyright 2022 The HuggingFace Authors.
 
 import contextlib
-import enum
+import json
 import logging
+import time
 import types
 from collections import Counter
 from datetime import datetime, timedelta
 from itertools import groupby
 from operator import itemgetter
-from typing import Dict, Generic, List, Literal, Optional, Type, TypedDict, TypeVar
+from types import TracebackType
+from typing import Generic, List, Literal, Optional, Sequence, Type, TypedDict, TypeVar
+from uuid import uuid4
 
+import pandas as pd
 import pytz
-from mongoengine import Document, DoesNotExist
-from mongoengine.fields import BooleanField, DateTimeField, EnumField, StringField
+from bson import ObjectId
+from mongoengine import Document
+from mongoengine.errors import DoesNotExist, NotUniqueError
+from mongoengine.fields import (
+    DateTimeField,
+    EnumField,
+    IntField,
+    ObjectIdField,
+    StringField,
+)
 from mongoengine.queryset.queryset import QuerySet
 
 from libcommon.constants import (
+    DEFAULT_DIFFICULTY_MAX,
+    DEFAULT_DIFFICULTY_MIN,
+    LOCK_TTL_SECONDS,
     QUEUE_COLLECTION_JOBS,
+    QUEUE_COLLECTION_LOCKS,
+    QUEUE_METRICS_COLLECTION,
     QUEUE_MONGOENGINE_ALIAS,
     QUEUE_TTL_SECONDS,
 )
-from libcommon.utils import get_datetime, inputs_to_string
+from libcommon.utils import (
+    FlatJobInfo,
+    JobInfo,
+    Priority,
+    Status,
+    get_datetime,
+    inputs_to_string,
+)
 
 # START monkey patching ### hack ###
 # see https://github.com/sbdchd/mongo-types#install
@@ -40,47 +64,28 @@ class QuerySetManager(Generic[U]):
         return QuerySet(cls, cls._get_collection())
 
 
+class StartedJobError(Exception):
+    pass
+
+
 # END monkey patching ### hack ###
-
-
-class Status(str, enum.Enum):
-    WAITING = "waiting"
-    STARTED = "started"
-    SUCCESS = "success"
-    ERROR = "error"
-    CANCELLED = "cancelled"
-    SKIPPED = "skipped"
-
-
-class Priority(str, enum.Enum):
-    NORMAL = "normal"
-    LOW = "low"
 
 
 class JobDict(TypedDict):
     type: str
     dataset: str
+    revision: str
     config: Optional[str]
     split: Optional[str]
     unicity_id: str
     namespace: str
-    force: bool
     priority: str
     status: str
+    difficulty: int
     created_at: datetime
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
     last_heartbeat: Optional[datetime]
-
-
-class JobInfo(TypedDict):
-    job_id: str
-    type: str
-    dataset: str
-    config: Optional[str]
-    split: Optional[str]
-    force: bool
-    priority: Priority
 
 
 class CountByStatus(TypedDict):
@@ -89,7 +94,6 @@ class CountByStatus(TypedDict):
     success: int
     error: int
     cancelled: int
-    skipped: int
 
 
 class DumpByPendingStatus(TypedDict):
@@ -101,26 +105,50 @@ class EmptyQueueError(Exception):
     pass
 
 
+class JobDoesNotExistError(DoesNotExist):
+    pass
+
+
+class AlreadyStartedJobError(Exception):
+    pass
+
+
+class LockTimeoutError(Exception):
+    pass
+
+
+class NoWaitingJobError(Exception):
+    pass
+
+
+class JobQueryFilters(TypedDict, total=False):
+    type__nin: List[str]
+    type__in: List[str]
+    difficulty__gte: int
+    difficulty__lte: int
+
+
 # States:
 # - waiting: started_at is None and finished_at is None: waiting jobs
 # - started: started_at is not None and finished_at is None: started jobs
 # - finished: started_at is not None and finished_at is not None: finished jobs
 # For a given set of arguments, only one job is allowed in the started state. No
 # restriction for the other states
-class Job(Document):
+class JobDocument(Document):
     """A job in the mongoDB database
 
     Args:
         type (`str`): The type of the job, identifies the queue
         dataset (`str`): The dataset on which to apply the job.
+        revision (`str`): The git revision of the dataset.
         config (`str`, optional): The config on which to apply the job.
         split (`str`, optional): The split on which to apply the job.
         unicity_id (`str`): A string that identifies the job uniquely. Only one job with the same unicity_id can be in
-          the started state.
+          the started state. The revision is not part of the unicity_id.
         namespace (`str`): The dataset namespace (user or organization) if any, else the dataset name (canonical name).
-        force (`bool`, optional): If True, the job SHOULD not be skipped. Defaults to False.
-        priority (`Priority`, optional): The priority of the job. Defaults to Priority.NORMAL.
+        priority (`Priority`, optional): The priority of the job. Defaults to Priority.LOW.
         status (`Status`, optional): The status of the job. Defaults to Status.WAITING.
+        difficulty (`int`): The difficulty of the job: 0=easy, 100=hard as a convention.
         created_at (`datetime`): The creation date of the job.
         started_at (`datetime`, optional): When the job has started.
         finished_at (`datetime`, optional): When the job has finished.
@@ -131,28 +159,29 @@ class Job(Document):
         "collection": QUEUE_COLLECTION_JOBS,
         "db_alias": QUEUE_MONGOENGINE_ALIAS,
         "indexes": [
-            "dataset",
-            "status",
-            ("type", "status"),
             ("type", "dataset", "status"),
-            ("type", "dataset", "config", "split", "status", "force", "priority"),
-            ("priority", "status", "created_at", "namespace", "unicity_id"),
-            ("priority", "status", "created_at", "type", "namespace"),
-            ("priority", "status", "type", "created_at", "namespace", "unicity_id"),
-            ("priority", "status", "created_at", "namespace", "type", "unicity_id"),
-            "-created_at",
-            {"fields": ["finished_at"], "expireAfterSeconds": QUEUE_TTL_SECONDS},
+            ("type", "dataset", "revision", "config", "split", "status", "priority"),
+            ("priority", "status", "created_at", "namespace"),
+            ("priority", "status", "type", "namespace", "unicity_id", "created_at", "-difficulty"),
+            ("status", "type"),
+            ("unicity_id", "-created_at", "status"),
+            {
+                "fields": ["finished_at"],
+                "expireAfterSeconds": QUEUE_TTL_SECONDS,
+                "partialFilterExpression": {"status": {"$in": [Status.SUCCESS, Status.ERROR, Status.CANCELLED]}},
+            },
         ],
     }
     type = StringField(required=True)
     dataset = StringField(required=True)
+    revision = StringField(required=True)
     config = StringField()
     split = StringField()
     unicity_id = StringField(required=True)
     namespace = StringField(required=True)
-    force = BooleanField(default=False)
-    priority = EnumField(Priority, default=Priority.NORMAL)
+    priority = EnumField(Priority, default=Priority.LOW)
     status = EnumField(Status, default=Status.WAITING)
+    difficulty = IntField(required=True)
     created_at = DateTimeField(required=True)
     started_at = DateTimeField()
     finished_at = DateTimeField()
@@ -162,33 +191,209 @@ class Job(Document):
         return {
             "type": self.type,
             "dataset": self.dataset,
+            "revision": self.revision,
             "config": self.config,
             "split": self.split,
             "unicity_id": self.unicity_id,
             "namespace": self.namespace,
-            "force": self.force,
             "priority": self.priority.value,
             "status": self.status.value,
+            "difficulty": self.difficulty,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "last_heartbeat": self.last_heartbeat,
         }
 
-    objects = QuerySetManager["Job"]()
+    objects = QuerySetManager["JobDocument"]()
 
     def info(self) -> JobInfo:
         return JobInfo(
             {
                 "job_id": str(self.pk),  # job.pk is the id. job.id is not recognized by mypy
                 "type": self.type,
-                "dataset": self.dataset,
-                "config": self.config,
-                "split": self.split,
-                "force": self.force,
+                "params": {
+                    "dataset": self.dataset,
+                    "revision": self.revision,
+                    "config": self.config,
+                    "split": self.split,
+                },
                 "priority": self.priority,
+                "difficulty": self.difficulty,
             }
         )
+
+    @classmethod
+    def get(cls, job_id: str) -> "JobDocument":
+        try:
+            return cls.objects(pk=job_id).get()
+        except DoesNotExist as e:
+            raise JobDoesNotExistError(f"Job does not exist: {job_id=}") from e
+
+    def flat_info(self) -> FlatJobInfo:
+        return FlatJobInfo(
+            {
+                "job_id": str(self.pk),  # job.pk is the id. job.id is not recognized by mypy
+                "type": self.type,
+                "dataset": self.dataset,
+                "revision": self.revision,
+                "config": self.config,
+                "split": self.split,
+                "priority": self.priority.value,
+                "status": self.status.value,
+                "difficulty": self.difficulty,
+                "created_at": self.created_at,
+            }
+        )
+
+
+DEFAULT_INCREASE_AMOUNT = 1
+DEFAULT_DECREASE_AMOUNT = -1
+
+
+class JobTotalMetricDocument(Document):
+    """Jobs total metric in mongoDB database, used to compute prometheus metrics.
+
+    Args:
+        job_type (`str`): job type
+        status (`str`): job status see libcommon.queue.Status
+        total (`int`): total of jobs
+        created_at (`datetime`): when the metric has been created.
+    """
+
+    id = ObjectIdField(db_field="_id", primary_key=True, default=ObjectId)
+    job_type = StringField(required=True, unique_with="status")
+    status = StringField(required=True)
+    total = IntField(required=True, default=0)
+    created_at = DateTimeField(default=get_datetime)
+
+    meta = {
+        "collection": QUEUE_METRICS_COLLECTION,
+        "db_alias": QUEUE_MONGOENGINE_ALIAS,
+        "indexes": [("job_type", "status")],
+    }
+    objects = QuerySetManager["JobTotalMetricDocument"]()
+
+
+class Lock(Document):
+    meta = {
+        "collection": QUEUE_COLLECTION_LOCKS,
+        "db_alias": QUEUE_MONGOENGINE_ALIAS,
+        "indexes": [
+            ("key", "owner"),
+            {
+                "fields": ["updated_at"],
+                "expireAfterSeconds": LOCK_TTL_SECONDS,
+                "partialFilterExpression": {"owner": None},
+            },
+        ],
+    }
+
+    key = StringField(primary_key=True)
+    owner = StringField()
+    job_id = StringField()  # deprecated
+
+    created_at = DateTimeField()
+    updated_at = DateTimeField()
+
+    objects = QuerySetManager["Lock"]()
+
+
+class lock(contextlib.AbstractContextManager["lock"]):
+    """
+    Provides a simple way of inter-applications communication using a MongoDB lock.
+
+    An example usage is to another worker of your application that a resource
+    or working directory is currently used in a job.
+
+    Example of usage:
+
+    ```python
+    key = json.dumps({"type": job.type, "dataset": job.dataset})
+    with lock(key=key, owner=job.pk):
+        ...
+    ```
+
+    Or using a try/except:
+
+    ```python
+    try:
+        key = json.dumps({"type": job.type, "dataset": job.dataset})
+        lock(key=key, owner=job.pk).acquire()
+    except TimeoutError:
+        ...
+    ```
+    """
+
+    _default_sleeps = (0.05, 0.05, 0.05, 1, 1, 1, 5)
+
+    def __init__(self, key: str, owner: str, sleeps: Sequence[float] = _default_sleeps) -> None:
+        self.key = key
+        self.owner = owner
+        self.sleeps = sleeps
+
+    def acquire(self) -> None:
+        for sleep in self.sleeps:
+            try:
+                Lock.objects(key=self.key, owner__in=[None, self.owner]).update(
+                    upsert=True,
+                    write_concern={"w": "majority", "fsync": True},
+                    read_concern={"level": "majority"},
+                    owner=self.owner,
+                    updated_at=get_datetime(),
+                )
+                return
+            except NotUniqueError:
+                logging.debug(f"Sleep {sleep}s to acquire lock '{self.key}' for owner='{self.owner}'")
+                time.sleep(sleep)
+        raise TimeoutError("lock couldn't be acquired")
+
+    def release(self) -> None:
+        Lock.objects(key=self.key, owner=self.owner).update(
+            write_concern={"w": "majority", "fsync": True},
+            read_concern={"level": "majority"},
+            owner=None,
+            updated_at=get_datetime(),
+        )
+
+    def __enter__(self) -> "lock":
+        self.acquire()
+        return self
+
+    def __exit__(
+        self, exctype: Optional[Type[BaseException]], excinst: Optional[BaseException], exctb: Optional[TracebackType]
+    ) -> Literal[False]:
+        self.release()
+        return False
+
+    @classmethod
+    def git_branch(cls, dataset: str, branch: str, owner: str, sleeps: Sequence[float] = _default_sleeps) -> "lock":
+        """
+        Lock a git branch of a dataset on the hub for read/write
+
+        Args:
+            dataset (`str`): the dataset repository
+            branch (`str`): the branch to lock
+            owner (`str`): the current job id that holds the lock
+            sleeps (`Sequence[float]`): the time in seconds to sleep between each attempt to acquire the lock
+        """
+        key = json.dumps({"dataset": dataset, "branch": branch})
+        return cls(key=key, owner=owner, sleeps=sleeps)
+
+
+def release_locks(owner: str) -> None:
+    """
+    Release all locks owned by the given owner
+
+    Args:
+        owner (`str`): the current owner that holds the locks
+    """
+    Lock.objects(owner=owner).update(
+        write_concern={"w": "majority", "fsync": True},
+        read_concern={"level": "majority"},
+        owner=None,
+        updated_at=get_datetime(),
+    )
 
 
 class Queue:
@@ -198,153 +403,131 @@ class Queue:
     the jobs. You can create multiple Queue objects, it has no effect on the database.
 
     It's a FIFO queue, with the following properties:
-    - a job is identified by its input arguments: unicity_id (type, dataset, config and split)
-    - a job can be in one of the following states: waiting, started, success, error, cancelled, skipped
-    - a job can be in the queue only once (unicity_id) in the "started" or "waiting" state
-    - a job can be in the queue multiple times in the other states (success, error, cancelled, skipped)
+    - a job is identified by its input arguments: unicity_id (type, dataset, config and split, NOT revision)
+    - a job can be in one of the following states: waiting, started, success, error, cancelled
+    - a job can be in the queue only once (unicity_id) in the "started" state
+    - a job can be in the queue multiple times in the other states
     - a job has a priority (two levels: NORMAL and LOW)
+    - a job has a difficulty (from 0: easy to 100: hard, as a convention)
     - the queue is ordered by priority then by the creation date of the jobs
     - datasets and users that already have started jobs are de-prioritized (using namespace)
-    - no more than `max_jobs_per_namespace` started jobs can exist for the same namespace
-
-    Args:
-        max_jobs_per_namespace (`int`): Maximum number of started jobs for the same namespace. We call a namespace the
-          part of the dataset name that is before the `/` separator (user or organization). If `/` is not present,
-          which is the case for the "canonical" datasets, the namespace is the dataset name.
-          0 or a negative value are ignored. Defaults to None.
     """
 
-    def __init__(
-        self,
-        max_jobs_per_namespace: Optional[int] = None,
-    ):
-        self.max_jobs_per_namespace = (
-            None if max_jobs_per_namespace is None or max_jobs_per_namespace < 1 else max_jobs_per_namespace
-        )
-
-    def _add_job(
+    def add_job(
         self,
         job_type: str,
         dataset: str,
+        revision: str,
+        difficulty: int,
         config: Optional[str] = None,
         split: Optional[str] = None,
-        force: bool = False,
-        priority: Priority = Priority.NORMAL,
-    ) -> Job:
+        priority: Priority = Priority.LOW,
+    ) -> JobDocument:
         """Add a job to the queue in the waiting state.
 
-        This method should not be called directly. Use `upsert_job` instead.
+        Note that the same "unicity_id" can have multiple jobs in the waiting state, with the same or different
+        revisions and or priorities.
 
         Args:
             job_type (`str`): The type of the job
             dataset (`str`): The dataset on which to apply the job.
+            revision (`str`): The git revision of the dataset.
+            difficulty (`int`): The difficulty of the job.
             config (`str`, optional): The config on which to apply the job.
             split (`str`, optional): The config on which to apply the job.
-            force (`bool`, optional): If True, the job SHOULD not be skipped. Defaults to False.
-            priority (`Priority`, optional): The priority of the job. Defaults to Priority.NORMAL.
+            priority (`Priority`, optional): The priority of the job. Defaults to Priority.LOW.
 
         Returns: the job
         """
-        return Job(
+        return JobDocument(
             type=job_type,
             dataset=dataset,
+            revision=revision,
             config=config,
             split=split,
             unicity_id=inputs_to_string(dataset=dataset, config=config, split=split, prefix=job_type),
             namespace=dataset.split("/")[0],
-            force=force,
             priority=priority,
             created_at=get_datetime(),
             status=Status.WAITING,
+            difficulty=difficulty,
         ).save()
 
-    def upsert_job(
-        self,
-        job_type: str,
-        dataset: str,
-        config: Optional[str] = None,
-        split: Optional[str] = None,
-        force: bool = False,
-        priority: Priority = Priority.NORMAL,
-    ) -> Job:
-        """Add, or update, a job to the queue in the waiting state.
+    def create_jobs(self, job_infos: List[JobInfo]) -> int:
+        """Creates jobs in the queue.
 
-        If jobs already exist with the same parameters in the waiting state, they are cancelled and replaced by a new
-        one.
-        Note that the new job inherits the force=True property if one of the previous waiting jobs had it.
-        In the same way, the new job inherits the highest priority.
+        They are created in the waiting state.
 
         Args:
-            job_type (`str`): The type of the job
-            dataset (`str`): The dataset on which to apply the job.
-            config (`str`, optional): The config on which to apply the job.
-            split (`str`, optional): The config on which to apply the job.
-            force (`bool`, optional): If True, the job SHOULD not be skipped. Defaults to False.
-            priority (`Priority`, optional): The priority of the job. Defaults to Priority.NORMAL.
-
-        Returns: the job
-        """
-        canceled_jobs = self.cancel_jobs(
-            job_type=job_type, dataset=dataset, config=config, split=split, statuses_to_cancel=[Status.WAITING]
-        )
-        for job in canceled_jobs:
-            if job["force"]:
-                force = True
-            if job["priority"] == Priority.NORMAL:
-                priority = Priority.NORMAL
-        return self._add_job(
-            job_type=job_type, dataset=dataset, config=config, split=split, force=force, priority=priority
-        )
-
-    def cancel_jobs(
-        self,
-        job_type: str,
-        dataset: str,
-        config: Optional[str] = None,
-        split: Optional[str] = None,
-        statuses_to_cancel: Optional[List[Status]] = None,
-    ) -> List[JobDict]:
-        """Cancel jobs from the queue.
-
-        Returns the list of canceled jobs (as JobDict, before they are canceled, to be able to know their previous
-        status)
-
-        Args:
-            job_type (`str`): The type of the job
-            dataset (`str`): The dataset on which to apply the job.
-            config (`str`, optional): The config on which to apply the job.
-            split (`str`, optional): The config on which to apply the job.
-            statuses_to_cancel (`list[Status]`, optional): The list of statuses to cancel. Defaults to
-                [Status.WAITING, Status.STARTED].
+            job_infos (`List[JobInfo]`): The jobs to be created.
 
         Returns:
-            `list[JobDict]`: The list of canceled jobs
+            `int`: The number of created jobs. 0 if we had an exception.
         """
-        if statuses_to_cancel is None:
-            statuses_to_cancel = [Status.WAITING, Status.STARTED]
-        existing = Job.objects(
-            type=job_type, dataset=dataset, config=config, split=split, status__in=statuses_to_cancel
-        )
-        job_dicts = [job.to_dict() for job in existing]
-        existing.update(finished_at=get_datetime(), status=Status.CANCELLED)
-        return job_dicts
+        try:
+            jobs = [
+                JobDocument(
+                    type=job_info["type"],
+                    dataset=job_info["params"]["dataset"],
+                    revision=job_info["params"]["revision"],
+                    config=job_info["params"]["config"],
+                    split=job_info["params"]["split"],
+                    unicity_id=inputs_to_string(
+                        dataset=job_info["params"]["dataset"],
+                        config=job_info["params"]["config"],
+                        split=job_info["params"]["split"],
+                        prefix=job_info["type"],
+                    ),
+                    namespace=job_info["params"]["dataset"].split("/")[0],
+                    priority=job_info["priority"],
+                    created_at=get_datetime(),
+                    status=Status.WAITING,
+                    difficulty=job_info["difficulty"],
+                )
+                for job_info in job_infos
+            ]
+            job_ids = JobDocument.objects.insert(jobs, load_bulk=False)
+            return len(job_ids)
+        except Exception:
+            return 0
+
+    def cancel_jobs_by_job_id(self, job_ids: List[str]) -> int:
+        """Cancel jobs from the queue.
+
+        If the job ids are not valid, they are ignored.
+
+        Args:
+            job_ids (`list[str]`): The list of job ids to cancel.
+
+        Returns:
+            `int`: The number of canceled jobs
+        """
+        try:
+            existing = JobDocument.objects(pk__in=job_ids)
+            existing.update(finished_at=get_datetime(), status=Status.CANCELLED)
+            return existing.count()
+        except Exception:
+            return 0
 
     def _get_next_waiting_job_for_priority(
         self,
         priority: Priority,
+        difficulty_min: Optional[int] = None,
+        difficulty_max: Optional[int] = None,
         job_types_blocked: Optional[list[str]] = None,
         job_types_only: Optional[list[str]] = None,
-    ) -> Job:
+    ) -> JobDocument:
         """Get the next job in the queue for a given priority.
 
         For a given priority, get the waiting job with the oldest creation date:
         - among the datasets that still have no started job.
         - if none, among the datasets that have the least started jobs:
-          - in the limit of `max_jobs_per_namespace` jobs per namespace
           - ensuring that the unicity_id field is unique among the started jobs.
 
         Args:
             priority (`Priority`): The priority of the job.
+            difficulty_min: if not None, only jobs with a difficulty greater or equal to this value are considered.
+            difficulty_max: if not None, only jobs with a difficulty lower or equal to this value are considered.
             job_types_blocked: if not None, jobs of the given types are not considered.
             job_types_only: if not None, only jobs of the given types are considered.
 
@@ -357,22 +540,26 @@ class Queue:
             f"Getting next waiting job for priority {priority}, blocked types: {job_types_blocked}, only types:"
             f" {job_types_only}"
         )
-        filters = {}
+        filters: JobQueryFilters = {}
         if job_types_blocked:
             filters["type__nin"] = job_types_blocked
         if job_types_only:
             filters["type__in"] = job_types_only
-        started_jobs = Job.objects(status=Status.STARTED, **filters)
+        if difficulty_min is not None and difficulty_min > DEFAULT_DIFFICULTY_MIN:
+            filters["difficulty__gte"] = difficulty_min
+        if difficulty_max is not None and difficulty_max < DEFAULT_DIFFICULTY_MAX:
+            filters["difficulty__lte"] = difficulty_max
+        started_jobs = JobDocument.objects(status=Status.STARTED, **filters)
         logging.debug(f"Number of started jobs: {started_jobs.count()}")
         started_job_namespaces = [job.namespace for job in started_jobs.only("namespace")]
         logging.debug(f"Started job namespaces: {started_job_namespaces}")
 
         next_waiting_job = (
-            Job.objects(
+            JobDocument.objects(
                 status=Status.WAITING, namespace__nin=set(started_job_namespaces), priority=priority, **filters
             )
             .order_by("+created_at")
-            .only("type", "dataset", "config", "split", "force")
+            .only("type", "dataset", "revision", "config", "split", "priority", "unicity_id")
             .no_cache()
             .first()
         )
@@ -385,20 +572,14 @@ class Queue:
         # all the waiting jobs, if any, are for namespaces that already have started jobs.
         #
         # Let's:
-        # - exclude the waiting jobs for datasets that already have too many started jobs (max_jobs_per_namespace)
         # - exclude the waiting jobs which unicity_id is already in a started job
         # and, among the remaining waiting jobs, let's:
         # - select the oldest waiting job for the namespace with the least number of started jobs
         started_unicity_ids = {job.unicity_id for job in started_jobs.only("unicity_id")}
         descending_frequency_namespace_counts = [
-            [namespace, count]
-            for namespace, count in Counter(started_job_namespaces).most_common()
-            if self.max_jobs_per_namespace is None or count < self.max_jobs_per_namespace
+            [namespace, count] for namespace, count in Counter(started_job_namespaces).most_common()
         ]
-        logging.debug(
-            f"Descending frequency namespace counts, with less than {self.max_jobs_per_namespace} started jobs:"
-            f" {descending_frequency_namespace_counts}"
-        )
+        logging.debug(f"Descending frequency namespace counts: {descending_frequency_namespace_counts}")
         descending_frequency_namespace_groups = [
             [item[0] for item in data] for (_, data) in groupby(descending_frequency_namespace_counts, itemgetter(1))
         ]
@@ -407,7 +588,7 @@ class Queue:
             least_common_namespaces_group = descending_frequency_namespace_groups.pop()
             logging.debug(f"Least common namespaces group: {least_common_namespaces_group}")
             next_waiting_job = (
-                Job.objects(
+                JobDocument.objects(
                     status=Status.WAITING,
                     namespace__in=least_common_namespaces_group,
                     unicity_id__nin=started_unicity_ids,
@@ -415,30 +596,32 @@ class Queue:
                     **filters,
                 )
                 .order_by("+created_at")
-                .only("type", "dataset", "config", "split", "force")
+                .only("type", "dataset", "revision", "config", "split", "priority", "unicity_id")
                 .no_cache()
                 .first()
             )
             if next_waiting_job is not None:
                 return next_waiting_job
-        raise EmptyQueueError(
-            f"no job available with the priority (within the limit of {self.max_jobs_per_namespace} started jobs per"
-            " namespace)"
-        )
+        raise EmptyQueueError("no job available with the priority")
 
     def get_next_waiting_job(
-        self, job_types_blocked: Optional[list[str]] = None, job_types_only: Optional[list[str]] = None
-    ) -> Job:
+        self,
+        difficulty_min: Optional[int] = None,
+        difficulty_max: Optional[int] = None,
+        job_types_blocked: Optional[list[str]] = None,
+        job_types_only: Optional[list[str]] = None,
+    ) -> JobDocument:
         """Get the next job in the queue.
 
         Get the waiting job with the oldest creation date with the following criteria:
         - among the highest priority jobs,
         - among the datasets that still have no started job.
         - if none, among the datasets that have the least started jobs:
-          - in the limit of `max_jobs_per_namespace` jobs per namespace
           - ensuring that the unicity_id field is unique among the started jobs.
 
         Args:
+            difficulty_min: if not None, only jobs with a difficulty greater or equal to this value are considered.
+            difficulty_max: if not None, only jobs with a difficulty lower or equal to this value are considered.
             job_types_blocked: if not None, jobs of the given types are not considered.
             job_types_only: if not None, only jobs of the given types are considered.
 
@@ -450,36 +633,110 @@ class Queue:
         for priority in [Priority.NORMAL, Priority.LOW]:
             with contextlib.suppress(EmptyQueueError):
                 return self._get_next_waiting_job_for_priority(
-                    priority=priority, job_types_blocked=job_types_blocked, job_types_only=job_types_only
+                    priority=priority,
+                    job_types_blocked=job_types_blocked,
+                    job_types_only=job_types_only,
+                    difficulty_min=difficulty_min,
+                    difficulty_max=difficulty_max,
                 )
-        raise EmptyQueueError(
-            f"no job available (within the limit of {self.max_jobs_per_namespace} started jobs per namespace)"
-        )
+        raise EmptyQueueError("no job available")
+
+    def _start_newest_job_and_cancel_others(self, job: JobDocument) -> JobDocument:
+        """Start a job (the newest one for unicity_id) and cancel the other ones.
+
+        A lock is used to ensure that the job is not started by another worker.
+
+        Args:
+            job: the job to start
+
+        Returns:
+            the started job
+
+        Raises:
+            AlreadyStartedJobError: if a started job already exist for the same unicity_id.
+            LockTimeoutError: if the lock could not be acquired after 20 retries.
+        """
+        # could be a method of Job
+        RETRIES = 20
+        # uuid is used to differentiate between workers
+        # otherwise another worker might acquire the lock
+        lock_owner = str(uuid4())
+        try:
+            # retry for 2 seconds
+            with lock(key=job.unicity_id, owner=lock_owner, sleeps=[0.1] * RETRIES):
+                # get all the pending jobs for the same unicity_id
+                waiting_jobs = JobDocument.objects(
+                    unicity_id=job.unicity_id, status__in=[Status.WAITING, Status.STARTED]
+                ).order_by("-created_at")
+                datetime = get_datetime()
+                # raise if any job has already been started for unicity_id
+                num_started_jobs = waiting_jobs(status=Status.STARTED).count()
+                if num_started_jobs > 0:
+                    if num_started_jobs > 1:
+                        logging.critical(f"job {job.unicity_id} has been started {num_started_jobs} times. Max is 1.")
+                    raise AlreadyStartedJobError(f"job {job.unicity_id} has been started by another worker")
+                # get the most recent one
+                first_job = waiting_jobs.first()
+                if not first_job:
+                    raise NoWaitingJobError(f"no waiting job could be found for {job.unicity_id}")
+                # start it
+                first_job.update(
+                    started_at=datetime,
+                    status=Status.STARTED,
+                    write_concern={"w": "majority", "fsync": True},
+                    read_concern={"level": "majority"},
+                )
+                # and cancel the other ones, if any
+                for job in waiting_jobs.skip(1):
+                    # TODO: try to do a bulk update (not sure it's possible)
+                    job.update(
+                        finished_at=datetime,
+                        status=Status.CANCELLED,
+                        write_concern={"w": "majority", "fsync": True},
+                        read_concern={"level": "majority"},
+                    )
+                return first_job.reload()
+        except TimeoutError as err:
+            raise LockTimeoutError(
+                f"could not acquire the lock for job {job.unicity_id} after {RETRIES} retries."
+            ) from err
 
     def start_job(
-        self, job_types_blocked: Optional[list[str]] = None, job_types_only: Optional[list[str]] = None
+        self,
+        difficulty_min: Optional[int] = None,
+        difficulty_max: Optional[int] = None,
+        job_types_blocked: Optional[list[str]] = None,
+        job_types_only: Optional[list[str]] = None,
     ) -> JobInfo:
         """Start the next job in the queue.
 
-        The job is moved from the waiting state to the started state.
+        The job is moved from the waiting state to the started state. A lock is used to ensure that only one worker
+        can start a job at a time.
 
         Args:
+            difficulty_min: if not None, only jobs with a difficulty greater or equal to this value are considered.
+            difficulty_max: if not None, only jobs with a difficulty lower or equal to this value are considered.
             job_types_blocked: if not None, jobs of the given types are not considered.
             job_types_only: if not None, only jobs of the given types are considered.
 
         Raises:
             EmptyQueueError: if there is no job in the queue, within the limit of the maximum number of started jobs
             for a dataset
+            AlreadyStartedJobError: if a started job already exist for the same unicity_id
+            LockTimeoutError: if the lock cannot be acquired
 
-        Returns: the job id, the type, the input arguments: dataset, config and split and the force flag
+        Returns: the job id, the type, the input arguments: dataset, revision, config and split
         """
+
         logging.debug(f"looking for a job to start, blocked types: {job_types_blocked}, only types: {job_types_only}")
         next_waiting_job = self.get_next_waiting_job(
-            job_types_blocked=job_types_blocked, job_types_only=job_types_only
+            job_types_blocked=job_types_blocked,
+            job_types_only=job_types_only,
+            difficulty_min=difficulty_min,
+            difficulty_max=difficulty_max,
         )
         logging.debug(f"job found: {next_waiting_job}")
         # ^ can raise EmptyQueueError
-        next_waiting_job.update(started_at=get_datetime(), status=Status.STARTED)
         if job_types_blocked and next_waiting_job.type in job_types_blocked:
             raise RuntimeError(
                 f"The job type {next_waiting_job.type} is in the list of blocked job types {job_types_only}"
@@ -488,9 +745,10 @@ class Queue:
             raise RuntimeError(
                 f"The job type {next_waiting_job.type} is not in the list of allowed job types {job_types_only}"
             )
-        return next_waiting_job.info()
+        started_job = self._start_newest_job_and_cancel_others(job=next_waiting_job)
+        return started_job.info()
 
-    def get_job_with_id(self, job_id: str) -> Job:
+    def get_job_with_id(self, job_id: str) -> JobDocument:
         """Get the job for a given job id.
 
         Args:
@@ -501,7 +759,7 @@ class Queue:
         Raises:
             DoesNotExist: if the job does not exist
         """
-        return Job.objects(pk=job_id).get()
+        return JobDocument.objects(pk=job_id).get()
 
     def get_job_type(self, job_id: str) -> str:
         """Get the job type for a given job id.
@@ -517,40 +775,80 @@ class Queue:
         job = self.get_job_with_id(job_id=job_id)
         return job.type
 
-    def finish_job(self, job_id: str, finished_status: Literal[Status.SUCCESS, Status.ERROR, Status.SKIPPED]) -> None:
-        """Finish a job in the queue.
-
-        The job is moved from the started state to the success or error state.
+    def _get_started_job(self, job_id: str) -> JobDocument:
+        """Get a started job, and raise if it's not in the correct format
+          (does not exist, not started, incorrect values for finished_at or started_at).
 
         Args:
             job_id (`str`, required): id of the job
-            success (`bool`, required): whether the job succeeded or not
 
-        Returns: nothing
+        Returns:
+            `Job`: the started job
+        """
+        job = JobDocument.objects(pk=job_id).get()
+        if job.status is not Status.STARTED:
+            raise StartedJobError(f"job {job.unicity_id} has a not the STARTED status ({job.status.value}).")
+        if job.finished_at is not None:
+            raise StartedJobError(f"job {job.unicity_id} has a non-empty finished_at field.")
+        if job.started_at is None:
+            raise StartedJobError(f"job {job.unicity_id} has an empty started_at field.")
+        return job
+
+    def is_job_started(self, job_id: str) -> bool:
+        """Check if a job is started, with the correct values for finished_at and started_at.
+
+        Args:
+            job_id (`str`, required): id of the job
+
+        Returns:
+            `bool`: whether the job exists, is started, and had the expected format (STARTED status, non-empty
+              started_at, empty finished_at)
         """
         try:
-            job = Job.objects(pk=job_id).get()
+            self._get_started_job(job_id=job_id)
+        except DoesNotExist:
+            logging.error(f"job {job_id} does not exist.")
+            return False
+        except StartedJobError as e:
+            logging.debug(f"job {job_id} has not the expected format for a started job: {e}")
+            return False
+        return True
+
+    def finish_job(self, job_id: str, is_success: bool) -> bool:
+        """Finish a job in the queue.
+
+        The job is moved from the started state to the success or error state. The existing locks are released.
+
+        Args:
+            job_id (`str`, required): id of the job
+            is_success (`bool`, required): whether the job succeeded or not
+
+        Returns:
+            `bool`: whether the job existed, and had the expected format (STARTED status, non-empty started_at, empty
+            finished_at) before finishing
+        """
+        try:
+            job = self._get_started_job(job_id=job_id)
         except DoesNotExist:
             logging.error(f"job {job_id} does not exist. Aborting.")
-            return
-        if job.status is not Status.STARTED:
-            logging.warning(
-                f"job {job.unicity_id} has a not the STARTED status ({job.status.value}). Force finishing anyway."
-            )
-        if job.finished_at is not None:
-            logging.warning(f"job {job.unicity_id} has a non-empty finished_at field. Force finishing anyway.")
-        if job.started_at is None:
-            logging.warning(f"job {job.unicity_id} has an empty started_at field. Force finishing anyway.")
+            return False
+        except StartedJobError as e:
+            logging.error(f"job {job_id} has not the expected format for a started job. Aborting: {e}")
+            return False
+        finished_status = Status.SUCCESS if is_success else Status.ERROR
         job.update(finished_at=get_datetime(), status=finished_status)
+        release_locks(owner=job_id)
+        return True
 
     def is_job_in_process(
-        self, job_type: str, dataset: str, config: Optional[str] = None, split: Optional[str] = None
+        self, job_type: str, dataset: str, revision: str, config: Optional[str] = None, split: Optional[str] = None
     ) -> bool:
         """Check if a job is in process (waiting or started).
 
         Args:
             job_type (`str`, required): job type
             dataset (`str`, required): dataset name
+            revision (`str`, required): dataset git revision
             config (`str`, optional): config name. Defaults to None.
             split (`str`, optional): split name. Defaults to None.
 
@@ -558,9 +856,10 @@ class Queue:
             `bool`: whether the job is in process (waiting or started)
         """
         return (
-            Job.objects(
+            JobDocument.objects(
                 type=job_type,
                 dataset=dataset,
+                revision=revision,
                 config=config,
                 split=split,
                 status__in=[Status.WAITING, Status.STARTED],
@@ -568,11 +867,52 @@ class Queue:
             > 0
         )
 
-    def cancel_started_jobs(self, job_type: str) -> None:
-        """Cancel all started jobs for a given type."""
-        for job in Job.objects(type=job_type, status=Status.STARTED.value):
-            job.update(finished_at=get_datetime(), status=Status.CANCELLED)
-            self.upsert_job(job_type=job.type, dataset=job.dataset, config=job.config, split=job.split)
+    def _get_df(self, jobs: List[FlatJobInfo]) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "job_id": pd.Series([job["job_id"] for job in jobs], dtype="str"),
+                "type": pd.Series([job["type"] for job in jobs], dtype="category"),
+                "dataset": pd.Series([job["dataset"] for job in jobs], dtype="str"),
+                "revision": pd.Series([job["revision"] for job in jobs], dtype="str"),
+                "config": pd.Series([job["config"] for job in jobs], dtype="str"),
+                "split": pd.Series([job["split"] for job in jobs], dtype="str"),
+                "priority": pd.Categorical(
+                    [job["priority"] for job in jobs],
+                    ordered=True,
+                    categories=[Priority.LOW.value, Priority.NORMAL.value],
+                ),
+                "status": pd.Categorical(
+                    [job["status"] for job in jobs],
+                    ordered=True,
+                    categories=[
+                        Status.WAITING.value,
+                        Status.STARTED.value,
+                        Status.SUCCESS.value,
+                        Status.ERROR.value,
+                        Status.CANCELLED.value,
+                    ],
+                ),
+                "created_at": pd.Series([job["created_at"] for job in jobs], dtype="datetime64[ns]"),
+            }
+        )
+        # ^ does not seem optimal at all, but I get the types right
+
+    def get_pending_jobs_df(self, dataset: str, job_types: Optional[List[str]] = None) -> pd.DataFrame:
+        filters = {}
+        if job_types:
+            filters["type__in"] = job_types
+        return self._get_df(
+            [
+                job.flat_info()
+                for job in JobDocument.objects(status__in=[Status.WAITING, Status.STARTED], **filters, dataset=dataset)
+            ]
+        )
+
+    def has_pending_jobs(self, dataset: str, job_types: Optional[List[str]] = None) -> bool:
+        filters = {}
+        if job_types:
+            filters["type__in"] = job_types
+        return JobDocument.objects(status__in=[Status.WAITING, Status.STARTED], **filters, dataset=dataset).count() > 0
 
     # special reports
     def count_jobs(self, status: Status, job_type: str) -> int:
@@ -584,7 +924,7 @@ class Queue:
 
         Returns: the number of jobs with the given status and the given type.
         """
-        return Job.objects(type=job_type, status=status.value).count()
+        return JobDocument.objects(type=job_type, status=status.value).count()
 
     def get_jobs_count_by_status(self, job_type: str) -> CountByStatus:
         """Count the number of jobs by status for a given job type.
@@ -602,7 +942,6 @@ class Queue:
             "success": self.count_jobs(status=Status.SUCCESS, job_type=job_type),
             "error": self.count_jobs(status=Status.ERROR, job_type=job_type),
             "cancelled": self.count_jobs(status=Status.CANCELLED, job_type=job_type),
-            "skipped": self.count_jobs(status=Status.SKIPPED, job_type=job_type),
         }
 
     def get_dump_with_status(self, status: Status, job_type: str) -> List[JobDict]:
@@ -614,7 +953,7 @@ class Queue:
 
         Returns: a list of jobs with the given status and the given type
         """
-        return [d.to_dict() for d in Job.objects(type=job_type, status=status.value)]
+        return [d.to_dict() for d in JobDocument.objects(status=status.value, type=job_type)]
 
     def get_dump_by_pending_status(self, job_type: str) -> DumpByPendingStatus:
         """Get the dump of the jobs by pending status for a given job type.
@@ -626,33 +965,6 @@ class Queue:
             "started": self.get_dump_with_status(job_type=job_type, status=Status.STARTED),
         }
 
-    def get_total_duration_per_dataset(self, job_type: str) -> Dict[str, int]:
-        """Get the total duration for the last 30 days of the finished jobs of a given type for every dataset
-
-        Returns: a dictionary where the keys are the dataset names and the values are the total duration of its
-        finished jobs during the last 30 days, in seconds (integer)
-        """
-        DURATION_IN_DAYS = 30
-        return {
-            d["_id"]: d["total_duration"]
-            for d in Job.objects(
-                type=job_type,
-                status__in=[Status.SUCCESS, Status.ERROR],
-                finished_at__gt=datetime.now() - timedelta(days=DURATION_IN_DAYS),
-            ).aggregate(
-                {
-                    "$group": {
-                        "_id": "$dataset",
-                        "total_duration": {
-                            "$sum": {
-                                "$dateDiff": {"startDate": "$started_at", "endDate": "$finished_at", "unit": "second"}
-                            }
-                        },
-                    }
-                }
-            )
-        }
-
     def get_dataset_pending_jobs_for_type(self, dataset: str, job_type: str) -> List[JobDict]:
         """Get the pending jobs of a dataset for a given job type.
 
@@ -660,8 +972,8 @@ class Queue:
         """
         return [
             d.to_dict()
-            for d in Job.objects(
-                type=job_type, dataset=dataset, status__in=[Status.WAITING.value, Status.STARTED.value]
+            for d in JobDocument.objects(
+                status__in=[Status.WAITING.value, Status.STARTED.value], type=job_type, dataset=dataset
             )
         ]
 
@@ -675,16 +987,17 @@ class Queue:
         except DoesNotExist:
             logging.warning(f"Heartbeat skipped because job {job_id} doesn't exist in the queue.")
             return
+        # no need to update metrics since it is just the last_heartbeat
         job.update(last_heartbeat=get_datetime())
 
-    def get_zombies(self, max_seconds_without_heartbeat: int) -> List[JobInfo]:
+    def get_zombies(self, max_seconds_without_heartbeat: float) -> List[JobInfo]:
         """Get the zombie jobs.
         It returns jobs without recent heartbeats, which means they crashed at one point and became zombies.
         Usually `max_seconds_without_heartbeat` is a factor of the time between two heartbeats.
 
         Returns: an array of the zombie job infos.
         """
-        started_jobs = Job.objects(status=Status.STARTED)
+        started_jobs = JobDocument.objects(status=Status.STARTED)
         if max_seconds_without_heartbeat <= 0:
             return []
         zombies = [
@@ -704,42 +1017,10 @@ class Queue:
         ]
         return [zombie.info() for zombie in zombies]
 
-    def kill_zombies(self, zombies: List[JobInfo]) -> int:
-        """Kill the zombie jobs in the queue, setting their status to ERROR.
-        It does nothing if the input list of zombies contain jobs that have already been updated and
-        are not in the STARTED status anymore.
-
-        Returns: number of killed zombies.
-        """
-        if not zombies:
-            return 0
-        zombie_job_ids = [zombie["job_id"] for zombie in zombies]
-        zombies_examples = zombie_job_ids[:10]
-        zombies_examples_str = ", ".join(zombies_examples) + ("..." if len(zombies_examples) != len(zombies) else "")
-        logging.info(f"Killing {len(zombies)} zombies. Job ids = {zombies_examples_str}")
-        return Job.objects(pk__in=zombie_job_ids, status=Status.STARTED).update(
-            status=Status.ERROR, finished_at=get_datetime()
-        )
-
-    def kill_long_job(self, long_job: JobInfo) -> int:
-        """Kill the long job in the queue, setting its status to ERROR.
-        It does nothing if the input job has already been updated and
-        is not in the STARTED status anymore.
-
-        Returns: number of killed long jobs.
-        """
-        long_job_id = long_job["job_id"]
-        logging.info(f"Killing a long job. Job id = {long_job_id}")
-        return Job.objects(pk=long_job_id, status=Status.STARTED).update(
-            status=Status.ERROR, finished_at=get_datetime()
-        )
-
 
 # only for the tests
 def _clean_queue_database() -> None:
     """Delete all the jobs in the database"""
-    Job.drop_collection()  # type: ignore
-
-
-# explicit re-export
-__all__ = ["DoesNotExist"]
+    JobDocument.drop_collection()  # type: ignore
+    JobTotalMetricDocument.drop_collection()  # type: ignore
+    Lock.drop_collection()  # type: ignore

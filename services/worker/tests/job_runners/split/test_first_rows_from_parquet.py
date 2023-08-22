@@ -4,18 +4,19 @@
 import os
 from dataclasses import replace
 from http import HTTPStatus
-from typing import Callable
-from unittest.mock import Mock, patch
+from typing import Callable, Generator
+from unittest.mock import patch
 
+import pyarrow.parquet as pq
 import pytest
-from libcommon.constants import PROCESSING_STEP_SPLIT_FIRST_ROWS_FROM_STREAMING_VERSION
+from datasets import Dataset
+from fsspec import AbstractFileSystem
 from libcommon.exceptions import CustomError
-from libcommon.processing_graph import ProcessingStep
-from libcommon.queue import Priority
+from libcommon.processing_graph import ProcessingGraph
 from libcommon.resources import CacheMongoResource, QueueMongoResource
-from libcommon.simple_cache import DoesNotExist, get_response, upsert_response
+from libcommon.simple_cache import upsert_response
 from libcommon.storage import StrPath
-from pyarrow.fs import LocalFileSystem
+from libcommon.utils import Priority
 
 from worker.config import AppConfig
 from worker.job_runners.split.first_rows_from_parquet import (
@@ -23,14 +24,13 @@ from worker.job_runners.split.first_rows_from_parquet import (
 )
 from worker.utils import get_json_size
 
-from ...fixtures.hub import get_default_config_split
-
-GetJobRunner = Callable[[str, str, str, AppConfig, bool], SplitFirstRowsFromParquetJobRunner]
+GetJobRunner = Callable[[str, str, str, AppConfig], SplitFirstRowsFromParquetJobRunner]
 
 
 @pytest.fixture
 def get_job_runner(
     assets_directory: StrPath,
+    parquet_metadata_directory: StrPath,
     cache_mongo_resource: CacheMongoResource,
     queue_mongo_resource: QueueMongoResource,
 ) -> GetJobRunner:
@@ -39,42 +39,56 @@ def get_job_runner(
         config: str,
         split: str,
         app_config: AppConfig,
-        force: bool = False,
     ) -> SplitFirstRowsFromParquetJobRunner:
+        processing_step_name = SplitFirstRowsFromParquetJobRunner.get_job_type()
+        processing_graph = ProcessingGraph(
+            {
+                "dataset-level": {"input_type": "dataset"},
+                "config-level": {
+                    "input_type": "config",
+                    "triggered_by": "dataset-level",
+                    "provides_config_parquet_metadata": True,
+                },
+                processing_step_name: {
+                    "input_type": "dataset",
+                    "job_runner_version": SplitFirstRowsFromParquetJobRunner.get_job_runner_version(),
+                    "triggered_by": "config-level",
+                },
+            }
+        )
         return SplitFirstRowsFromParquetJobRunner(
             job_info={
                 "type": SplitFirstRowsFromParquetJobRunner.get_job_type(),
-                "dataset": dataset,
-                "config": config,
-                "split": split,
+                "params": {
+                    "dataset": dataset,
+                    "revision": "revision",
+                    "config": config,
+                    "split": split,
+                },
                 "job_id": "job_id",
-                "force": force,
                 "priority": Priority.NORMAL,
+                "difficulty": 50,
             },
             app_config=app_config,
-            processing_step=ProcessingStep(
-                name=SplitFirstRowsFromParquetJobRunner.get_job_type(),
-                input_type="split",
-                requires=[],
-                required_by_dataset_viewer=True,
-                ancestors=[],
-                children=[],
-                parents=[],
-                job_runner_version=SplitFirstRowsFromParquetJobRunner.get_job_runner_version(),
-            ),
+            processing_step=processing_graph.get_processing_step(processing_step_name),
+            processing_graph=processing_graph,
             assets_directory=assets_directory,
+            parquet_metadata_directory=parquet_metadata_directory,
         )
 
     return _get_job_runner
 
 
-def test_doesnotexist(app_config: AppConfig, get_job_runner: GetJobRunner) -> None:
-    dataset = "doesnotexist"
-    dataset, config, split = get_default_config_split(dataset)
-    job_runner = get_job_runner(dataset, config, split, app_config, False)
-    assert not job_runner.process()
-    with pytest.raises(DoesNotExist):
-        get_response(kind=job_runner.processing_step.cache_kind, dataset=dataset, config=config, split=split)
+@pytest.fixture
+def ds() -> Dataset:
+    return Dataset.from_dict({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
+
+
+@pytest.fixture
+def ds_fs(ds: Dataset, tmpfs: AbstractFileSystem) -> Generator[AbstractFileSystem, None, None]:
+    with tmpfs.open("config/train/0000.parquet", "wb") as f:
+        ds.to_parquet(f)
+    yield tmpfs
 
 
 @pytest.mark.parametrize(
@@ -86,6 +100,9 @@ def test_doesnotexist(app_config: AppConfig, get_job_runner: GetJobRunner) -> No
     ],
 )
 def test_compute(
+    ds: Dataset,
+    ds_fs: AbstractFileSystem,
+    parquet_metadata_directory: StrPath,
     get_job_runner: GetJobRunner,
     app_config: AppConfig,
     rows_max_bytes: int,
@@ -93,31 +110,39 @@ def test_compute(
     error_code: str,
 ) -> None:
     dataset, config, split = "dataset", "config", "split"
+    parquet_file = ds_fs.open("config/train/0000.parquet")
+    fake_url = (
+        "https://fake.huggingface.co/datasets/dataset/resolve/refs%2Fconvert%2Fparquet/config/train/0000.parquet"
+    )
+    fake_metadata_subpath = "fake-parquet-metadata/dataset/config/train/0000.parquet"
+
+    config_parquet_metadata_content = {
+        "parquet_files_metadata": [
+            {
+                "dataset": dataset,
+                "config": config,
+                "split": split,
+                "url": fake_url,  # noqa: E501
+                "filename": "0000.parquet",
+                "size": parquet_file.size,
+                "num_rows": len(ds),
+                "parquet_metadata_subpath": fake_metadata_subpath,
+            }
+        ]
+    }
+
     upsert_response(
-        kind="config-parquet",
+        kind="config-level",
         dataset=dataset,
         config=config,
-        content={
-            "parquet_files": [
-                {
-                    "dataset": dataset,
-                    "config": config,
-                    "split": split,
-                    "filename": f"{dataset}-{split}.parquet",
-                    "size": 1000,
-                }
-            ]
-        },
+        content=config_parquet_metadata_content,
         http_status=HTTPStatus.OK,
     )
 
-    with patch("worker.job_runners.split.first_rows_from_parquet.get_parquet_fs") as mock_read:
-        initial_location = os.getcwd()
-        os.chdir("tests/job_runners/split")
-        # TODO:  Make localsystem by relative path
-        fs = LocalFileSystem()
-        mock_read.return_value = fs
-        # ^ Mocking file system with local file
+    parquet_metadata = pq.read_metadata(ds_fs.open("config/train/0000.parquet"))
+    with patch("libcommon.parquet_utils.HTTPFile", return_value=parquet_file) as mock_http_file, patch(
+        "pyarrow.parquet.read_metadata", return_value=parquet_metadata
+    ) as mock_read_metadata, patch("pyarrow.parquet.read_schema", return_value=ds.data.schema) as mock_read_schema:
         job_runner = get_job_runner(
             dataset,
             config,
@@ -134,10 +159,8 @@ def test_compute(
                     columns_max_number=columns_max_number,
                 ),
             ),
-            False,
         )
 
-        job_runner.get_dataset_git_revision = Mock(return_value="1.0.0")  # type: ignore
         if error_code:
             with pytest.raises(CustomError) as error_info:
                 job_runner.compute()
@@ -148,12 +171,12 @@ def test_compute(
             assert response
             assert response["rows"]
             assert response["features"]
-            assert len(response["rows"]) == 3  # testing file has 3 rows see config/dataset-split.parquet file
-            assert len(response["features"]) == 2  # testing file has 2 columns see config/dataset-split.parquet file
+            assert len(response["rows"]) == 3  # testing file has 3 rows see config/train/0000.parquet file
+            assert len(response["features"]) == 2  # testing file has 2 columns see config/train/0000.parquet file
             assert response["features"][0]["feature_idx"] == 0
             assert response["features"][0]["name"] == "col1"
             assert response["features"][0]["type"]["_type"] == "Value"
-            assert response["features"][0]["type"]["dtype"] == "int32"
+            assert response["features"][0]["type"]["dtype"] == "int64"
             assert response["features"][1]["feature_idx"] == 1
             assert response["features"][1]["name"] == "col2"
             assert response["features"][1]["type"]["_type"] == "Value"
@@ -167,49 +190,14 @@ def test_compute(
             assert response["rows"][2]["row_idx"] == 2
             assert response["rows"][2]["truncated_cells"] == []
             assert response["rows"][2]["row"] == {"col1": 3, "col2": "c"}
-        os.chdir(initial_location)
 
-
-@pytest.mark.parametrize(
-    "streaming_response_status,dataset_git_revision,error_code,status_code",
-    [
-        (HTTPStatus.OK, "CURRENT_GIT_REVISION", "ResponseAlreadyComputedError", HTTPStatus.INTERNAL_SERVER_ERROR),
-        (HTTPStatus.INTERNAL_SERVER_ERROR, "CURRENT_GIT_REVISION", "CachedResponseNotFound", HTTPStatus.NOT_FOUND),
-        (HTTPStatus.OK, "DIFFERENT_GIT_REVISION", "CachedResponseNotFound", HTTPStatus.NOT_FOUND),
-    ],
-)
-def test_response_already_computed(
-    app_config: AppConfig,
-    get_job_runner: GetJobRunner,
-    streaming_response_status: HTTPStatus,
-    dataset_git_revision: str,
-    error_code: str,
-    status_code: HTTPStatus,
-) -> None:
-    dataset = "dataset"
-    config = "config"
-    split = "split"
-    current_dataset_git_revision = "CURRENT_GIT_REVISION"
-    upsert_response(
-        kind="split-first-rows-from-streaming",
-        dataset=dataset,
-        config=config,
-        split=split,
-        content={},
-        dataset_git_revision=dataset_git_revision,
-        job_runner_version=PROCESSING_STEP_SPLIT_FIRST_ROWS_FROM_STREAMING_VERSION,
-        progress=1.0,
-        http_status=streaming_response_status,
-    )
-    job_runner = get_job_runner(
-        dataset,
-        config,
-        split,
-        app_config,
-        False,
-    )
-    job_runner.get_dataset_git_revision = Mock(return_value=current_dataset_git_revision)  # type: ignore
-    with pytest.raises(CustomError) as exc_info:
-        job_runner.compute()
-    assert exc_info.value.status_code == status_code
-    assert exc_info.value.code == error_code
+            assert len(mock_http_file.call_args_list) == 1
+            assert mock_http_file.call_args_list[0][0][1] == fake_url
+            assert len(mock_read_metadata.call_args_list) == 1
+            assert mock_read_metadata.call_args_list[0][0][0] == os.path.join(
+                parquet_metadata_directory, fake_metadata_subpath
+            )
+            assert len(mock_read_schema.call_args_list) == 1
+            assert mock_read_schema.call_args_list[0][0][0] == os.path.join(
+                parquet_metadata_directory, fake_metadata_subpath
+            )

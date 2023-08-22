@@ -5,19 +5,16 @@ from http import HTTPStatus
 from typing import Any, Callable
 
 import pytest
-from libcommon.processing_graph import ProcessingStep
-from libcommon.queue import Priority
+from libcommon.exceptions import PreviousStepFormatError
+from libcommon.processing_graph import ProcessingGraph
 from libcommon.resources import CacheMongoResource, QueueMongoResource
-from libcommon.simple_cache import SplitFullName, upsert_response
+from libcommon.simple_cache import CachedArtifactError, upsert_response
+from libcommon.utils import Priority
 
 from worker.config import AppConfig
-from worker.job_runner import PreviousStepError
-from worker.job_runners.dataset.split_names import (
-    DatasetSplitNamesJobRunner,
-    PreviousStepFormatError,
-)
+from worker.job_runners.dataset.split_names import DatasetSplitNamesJobRunner
 
-GetJobRunner = Callable[[str, AppConfig, bool], DatasetSplitNamesJobRunner]
+GetJobRunner = Callable[[str, AppConfig], DatasetSplitNamesJobRunner]
 
 
 @pytest.fixture
@@ -28,30 +25,31 @@ def get_job_runner(
     def _get_job_runner(
         dataset: str,
         app_config: AppConfig,
-        force: bool = False,
     ) -> DatasetSplitNamesJobRunner:
+        processing_step_name = DatasetSplitNamesJobRunner.get_job_type()
+        processing_graph = ProcessingGraph(
+            {
+                processing_step_name: {
+                    "input_type": "dataset",
+                    "job_runner_version": DatasetSplitNamesJobRunner.get_job_runner_version(),
+                }
+            }
+        )
         return DatasetSplitNamesJobRunner(
             job_info={
                 "type": DatasetSplitNamesJobRunner.get_job_type(),
-                "dataset": dataset,
-                "config": None,
-                "split": None,
+                "params": {
+                    "dataset": dataset,
+                    "revision": "revision",
+                    "config": None,
+                    "split": None,
+                },
                 "job_id": "job_id",
-                "force": force,
                 "priority": Priority.NORMAL,
+                "difficulty": 50,
             },
-            common_config=app_config.common,
-            worker_config=app_config.worker,
-            processing_step=ProcessingStep(
-                name=DatasetSplitNamesJobRunner.get_job_type(),
-                input_type="dataset",
-                requires=[],
-                required_by_dataset_viewer=False,
-                ancestors=[],
-                children=[],
-                parents=[],
-                job_runner_version=DatasetSplitNamesJobRunner.get_job_runner_version(),
-            ),
+            app_config=app_config,
+            processing_step=processing_graph.get_processing_step(processing_step_name),
         )
 
     return _get_job_runner
@@ -148,7 +146,7 @@ def test_compute_progress(
     # we could also have tested if dataset-info has a response (it's one case among many, see
     # libcommon.simple_cache.get_best_response)
     upsert_response(
-        kind="/config-names",
+        kind="dataset-config-names",
         dataset=dataset,
         content={
             "config_names": [
@@ -165,20 +163,20 @@ def test_compute_progress(
         # we don't really need both parent responses here, but why not (it's one case among many, see
         # libcommon.simple_cache.get_best_response)
         upsert_response(
-            kind="/split-names-from-dataset-info",
+            kind="config-split-names-from-info",
             dataset=dataset,
             config=config["config"],
             content=config["response"],
             http_status=HTTPStatus.OK,
         )
         upsert_response(
-            kind="/split-names-from-streaming",
+            kind="config-split-names-from-streaming",
             dataset=dataset,
             config=config["config"],
             content=config["response"],
             http_status=HTTPStatus.OK,
         )
-    job_runner = get_job_runner(dataset, app_config, False)
+    job_runner = get_job_runner(dataset, app_config)
     response = job_runner.compute()
     assert response.content == expected_content
     assert response.progress == progress
@@ -190,7 +188,7 @@ def test_compute_error(app_config: AppConfig, get_job_runner: GetJobRunner) -> N
     # we could also have tested if dataset-info has a response (it's one case among many, see
     # libcommon.simple_cache.get_best_response)
     upsert_response(
-        kind="/config-names",
+        kind="dataset-config-names",
         dataset=dataset,
         content={
             "config_names": [
@@ -205,20 +203,20 @@ def test_compute_error(app_config: AppConfig, get_job_runner: GetJobRunner) -> N
     # we don't really need both parent responses here, but why not (it's one case among many, see
     # libcommon.simple_cache.get_best_response)
     upsert_response(
-        kind="/split-names-from-dataset-info",
+        kind="config-split-names-from-info",
         dataset=dataset,
         config=config,
         content={},
         http_status=HTTPStatus.INTERNAL_SERVER_ERROR,
     )
     upsert_response(
-        kind="/split-names-from-streaming",
+        kind="config-split-names-from-streaming",
         dataset=dataset,
         config=config,
         content={},
         http_status=HTTPStatus.INTERNAL_SERVER_ERROR,
     )
-    job_runner = get_job_runner(dataset, app_config, False)
+    job_runner = get_job_runner(dataset, app_config)
     response = job_runner.compute()
     assert response.content == {
         "splits": [],
@@ -232,7 +230,7 @@ def test_compute_format_error(app_config: AppConfig, get_job_runner: GetJobRunne
     dataset = "error"
     config = "error"
     upsert_response(
-        kind="/config-names",
+        kind="dataset-config-names",
         dataset=dataset,
         content={
             "config_names": [
@@ -244,58 +242,30 @@ def test_compute_format_error(app_config: AppConfig, get_job_runner: GetJobRunne
         },
         http_status=HTTPStatus.OK,
     )
-    # here, /split-names-from-dataset-info will be picked because it's the first success response
-    # with progress==1.0 (see libcommon.simple_cache.get_best_response), but it's format is wrong
-    # while the other one (/split-names-from-streaming) is correct
+    # here, 'config-split-names-from-info' will be picked because it's the first success response
+    # with progress==1.0 (see libcommon.simple_cache.get_best_response), but its format is wrong
+    # while the other one ('config-split-names-from-streaming') is correct
     upsert_response(
-        kind="/split-names-from-dataset-info",
+        kind="config-split-names-from-info",
         dataset=dataset,
         config=config,
         content={"wrong_format": []},
         http_status=HTTPStatus.OK,
     )
     upsert_response(
-        kind="/split-names-from-streaming",
+        kind="config-split-names-from-streaming",
         dataset=dataset,
         config=config,
         content={"splits": [{"dataset": "dataset", "config": "config", "split": "split"}]},
         http_status=HTTPStatus.OK,
     )
-    job_runner = get_job_runner(dataset, app_config, False)
+    job_runner = get_job_runner(dataset, app_config)
     with pytest.raises(PreviousStepFormatError):
         job_runner.compute()
 
 
 def test_doesnotexist(app_config: AppConfig, get_job_runner: GetJobRunner) -> None:
     dataset = "doesnotexist"
-    job_runner = get_job_runner(dataset, app_config, False)
-    with pytest.raises(PreviousStepError):
+    job_runner = get_job_runner(dataset, app_config)
+    with pytest.raises(CachedArtifactError):
         job_runner.compute()
-
-
-def test_get_new_splits(app_config: AppConfig, get_job_runner: GetJobRunner) -> None:
-    dataset = "dataset"
-    job_runner = get_job_runner(dataset, app_config, False)
-    content = {
-        "splits": [
-            {
-                "dataset": dataset,
-                "config": "config_a",
-                "split": "split_a",
-            },
-            {
-                "dataset": dataset,
-                "config": "config_b",
-                "split": "split_b",
-            },
-        ],
-        "pending": [],
-        "failed": [],
-    }
-    expected = {
-        SplitFullName(dataset=dataset, config="config_a", split="split_a"),
-        SplitFullName(dataset=dataset, config="config_b", split="split_b"),
-    }
-    new_splits = job_runner.get_new_splits(content=content)
-    assert new_splits
-    assert new_splits == expected

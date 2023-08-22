@@ -5,7 +5,11 @@ from itertools import product
 import pandas as pd
 import requests
 import gradio as gr
+from libcommon.processing_graph import ProcessingGraph
+from libcommon.config import ProcessingGraphConfig
 import matplotlib
+import matplotlib.pyplot as plt
+import networkx as nx
 import huggingface_hub as hfh
 import duckdb
 import json
@@ -21,6 +25,8 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 
 DSS_ENDPOINT = DEV_DSS_ENDPOINT if DEV else PROD_DSS_ENDPOINT
 
+PROCESSING_GRAPH = ProcessingGraph(ProcessingGraphConfig().specification)
+
 pending_jobs_df = None
 
 def healthcheck():
@@ -33,6 +39,15 @@ def healthcheck():
 
     else:
         return f"❌ Failed to connect to {DSS_ENDPOINT} (error {response.status_code})"
+
+
+def draw_graph(width, height):
+    graph = PROCESSING_GRAPH._nx_graph
+
+    pos = nx.nx_agraph.graphviz_layout(graph, prog="dot")
+    fig = plt.figure(figsize=(width, height))
+    nx.draw_networkx(graph, pos=pos, node_color="#d1b2f8", node_size=500)
+    return fig
 
 
 with gr.Blocks() as demo:
@@ -64,11 +79,13 @@ with gr.Blocks() as demo:
                 query_pending_jobs_button = gr.Button("Run")
                 pending_jobs_query_result_df = gr.DataFrame()
             with gr.Tab("Refresh dataset"):
-                refresh_type = gr.Textbox(label="Processing step type", placeholder="split-first-rows-from-streaming")
+                job_types = [processing_step.job_type for processing_step in PROCESSING_GRAPH.get_topologically_ordered_processing_steps()]
+                refresh_type = gr.Dropdown(job_types, multiselect=False, label="job type", value=job_types[0])
                 refresh_dataset_name = gr.Textbox(label="dataset", placeholder="c4")
                 refresh_config_name = gr.Textbox(label="config (optional)", placeholder="en")
                 refresh_split_name = gr.Textbox(label="split (optional)", placeholder="train, test")
                 gr.Markdown("*you can select multiple values by separating them with commas, e.g. split='train, test'*")
+                refresh_priority = gr.Dropdown(["low", "normal"], multiselect=False, label="priority", value="low")
                 refresh_dataset_button = gr.Button("Force refresh dataset")
                 refresh_dataset_output = gr.Markdown("")
             with gr.Tab("Dataset status"):
@@ -82,7 +99,15 @@ with gr.Blocks() as demo:
                 backfill_plan_table = gr.DataFrame(visible=False)
                 backfill_execute_button = gr.Button("Execute backfill plan", visible=False)
                 backfill_execute_error = gr.Markdown("", visible=False)
-
+            with gr.Tab("Processing graph"):
+                gr.Markdown("## 💫 Please, don't forget to rebuild (factory reboot) this space immediately after each deploy 💫")
+                gr.Markdown("### so that we get the 🚀 production 🚀 version of the graph here ")
+                with gr.Row():
+                    width = gr.Slider(1, 30, 19, step=1, label="Width")
+                    height = gr.Slider(1, 30, 15, step=1, label="Height")
+                output = gr.Plot()
+                draw_button = gr.Button("Plot processing graph")
+                draw_button.click(draw_graph, inputs=[width, height], outputs=output)
 
     def auth(token):
         if not token:
@@ -115,6 +140,12 @@ with gr.Blocks() as demo:
                 for job_state in pending_jobs[job_type]
                 for job in pending_jobs[job_type][job_state]
             ])
+            if "started_at" in pending_jobs_df.columns:
+                pending_jobs_df["started_at"] = pd.to_datetime(pending_jobs_df["started_at"], errors="coerce")
+            if "finished_at" in pending_jobs_df.columns:
+                pending_jobs_df["finished_at"] = pd.to_datetime(pending_jobs_df["finished_at"], errors="coerce")
+            if "last_heartbeat" in pending_jobs_df.columns:
+                pending_jobs_df["last_heartbeat"] = pd.to_datetime(pending_jobs_df["last_heartbeat"], errors="coerce")
             if "created_at" in pending_jobs_df.columns:
                 pending_jobs_df["created_at"] = pd.to_datetime(pending_jobs_df["created_at"], errors="coerce")
                 most_recent = pending_jobs_df.nlargest(5, "created_at")
@@ -140,7 +171,7 @@ with gr.Blocks() as demo:
         if response.status_code == 200:
             dataset_status = response.json()
             cached_responses_df = pd.DataFrame([{
-                    "type": job_type,
+                    "kind": cached_response["kind"],
                     "dataset": cached_response["dataset"],
                     "config": cached_response["config"],
                     "split": cached_response["split"],
@@ -156,12 +187,12 @@ with gr.Blocks() as demo:
                 for cached_response in content["cached_responses"]
             ])
             jobs_df = pd.DataFrame([{
-                    "type": job_type,
+                    "type": job["type"],
                     "dataset": job["dataset"],
+                    "revision": job["revision"],
                     "config": job["config"],
                     "split": job["split"],
                     "namespace": job["namespace"],
-                    "force": job["force"],
                     "priority": job["priority"],
                     "status": job["status"],
                     "created_at": job["created_at"],
@@ -184,7 +215,7 @@ with gr.Blocks() as demo:
     
     def get_backfill_plan(token, dataset):
         headers = {"Authorization": f"Bearer {token}"}
-        response = requests.get(f"{DSS_ENDPOINT}/admin/dataset-state?dataset={dataset}", headers=headers, timeout=60)
+        response = requests.get(f"{DSS_ENDPOINT}/admin/dataset-backfill-plan?dataset={dataset}", headers=headers, timeout=60)
         if response.status_code != 200:
             return {
                 backfill_message: gr.update(value=f"❌ Failed to get backfill plan for {dataset} (error {response.status_code})", visible=True),
@@ -192,8 +223,8 @@ with gr.Blocks() as demo:
                 backfill_execute_button: gr.update( visible=False),
                 backfill_execute_error: gr.update( visible=False)
             }
-        dataset_state = response.json()
-        tasks_df = pd.DataFrame(dataset_state["plan"])
+        tasks = response.json()
+        tasks_df = pd.DataFrame(tasks)
         has_tasks = len(tasks_df) > 0
         return {
             backfill_message: gr.update(
@@ -230,15 +261,14 @@ The cache is outdated or in an incoherent state. Here is the plan to backfill th
             return {pending_jobs_query_result_df: gr.update(value=pd.DataFrame({"Error": [f"❌ {str(error)}"]}))}
         return {pending_jobs_query_result_df: gr.update(value=result)}
 
-    def refresh_dataset(token, refresh_types, refresh_dataset_names, refresh_config_names, refresh_split_names):
+    def refresh_dataset(token, refresh_type, refresh_dataset_names, refresh_config_names, refresh_split_names, refresh_priority):
         headers = {"Authorization": f"Bearer {token}"}
         all_results = ""
-        for refresh_type, refresh_dataset_name, refresh_config_name, refresh_split_name in product(
-            refresh_types.split(","), refresh_dataset_names.split(","), refresh_config_names.split(","), refresh_split_names.split(",")
+        for refresh_dataset_name, refresh_config_name, refresh_split_name in product(
+            refresh_dataset_names.split(","), refresh_config_names.split(","), refresh_split_names.split(",")
         ):
-            refresh_types = refresh_types.strip()
             refresh_dataset_name = refresh_dataset_name.strip()
-            params = {"dataset": refresh_dataset_name}
+            params = {"dataset": refresh_dataset_name, "priority": refresh_priority}
             if refresh_config_name:
                 refresh_config_name = refresh_config_name.strip()
                 params["config"] = refresh_config_name
@@ -246,7 +276,7 @@ The cache is outdated or in an incoherent state. Here is the plan to backfill th
                 refresh_split_name = refresh_split_name.strip()
                 params["split"] = refresh_split_name
             params = urllib.parse.urlencode(params)
-            response = requests.post(f"{DSS_ENDPOINT}/admin/force-refresh{refresh_type}?{params}", headers=headers, timeout=60)
+            response = requests.post(f"{DSS_ENDPOINT}/admin/force-refresh/{refresh_type}?{params}", headers=headers, timeout=60)
             if response.status_code == 200:
                 result = f"[{refresh_dataset_name}] ✅ Added processing step to the queue: '{refresh_type}'"
                 if refresh_config_name:
@@ -268,7 +298,7 @@ The cache is outdated or in an incoherent state. Here is the plan to backfill th
     fetch_pending_jobs_button.click(view_jobs, inputs=token_box, outputs=[recent_pending_jobs_table, pending_jobs_summary_table])
     query_pending_jobs_button.click(query_jobs, inputs=pending_jobs_query, outputs=[pending_jobs_query_result_df])
     
-    refresh_dataset_button.click(refresh_dataset, inputs=[token_box, refresh_type, refresh_dataset_name, refresh_config_name, refresh_split_name], outputs=refresh_dataset_output)
+    refresh_dataset_button.click(refresh_dataset, inputs=[token_box, refresh_type, refresh_dataset_name, refresh_config_name, refresh_split_name, refresh_priority], outputs=refresh_dataset_output)
     dataset_status_button.click(get_dataset_status_and_backfill_plan, inputs=[token_box, dataset_name], outputs=[cached_responses_table, jobs_table, backfill_message, backfill_plan_table, backfill_execute_button, backfill_execute_error])
     backfill_execute_button.click(execute_backfill_plan, inputs=[token_box, dataset_name], outputs=[cached_responses_table, jobs_table, backfill_message, backfill_plan_table, backfill_execute_button, backfill_execute_error])
 

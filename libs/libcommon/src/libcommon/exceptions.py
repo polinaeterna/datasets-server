@@ -5,7 +5,7 @@ import logging
 import sys
 import traceback
 from http import HTTPStatus
-from typing import List, Optional, TypedDict, Union
+from typing import List, Literal, Optional, TypedDict, Union
 
 
 class ErrorResponseWithoutCause(TypedDict):
@@ -70,3 +70,452 @@ class CustomError(LoggedError):
 
     def as_response(self) -> ErrorResponse:
         return self.as_response_with_cause() if self.disclose_cause else self.as_response_without_cause()
+
+
+CacheableErrorCode = Literal[
+    "CacheDirectoryNotInitializedError",
+    "ConfigNamesError",
+    "ComputationError",
+    "CreateCommitError",
+    "DatasetInBlockListError",
+    "DatasetInfoHubRequestError",
+    "DatasetManualDownloadError",
+    "DatasetModuleNotInstalledError",
+    "DatasetNotFoundError",
+    "DatasetRevisionEmptyError",
+    "DatasetRevisionNotFoundError",
+    "DatasetWithTooManyConfigsError",
+    "DatasetWithTooManyParquetFilesError",
+    "DisabledViewerError",
+    "DuckDBIndexFileNotFoundError",
+    "EmptyDatasetError",
+    "ExternalFilesSizeRequestConnectionError",
+    "ExternalFilesSizeRequestError",
+    "ExternalFilesSizeRequestHTTPError",
+    "ExternalFilesSizeRequestTimeoutError",
+    "ExternalServerError",
+    "FeaturesError",
+    "FileSystemError",
+    "InfoError",
+    "JobManagerCrashedError",
+    "JobManagerExceededMaximumDurationError",
+    "LockedDatasetTimeoutError",
+    "MissingSpawningTokenError",
+    "NoIndexableColumnsError",
+    "NoSupportedFeaturesError",
+    "NormalRowsError",
+    "ParameterMissingError",
+    "ParquetResponseEmptyError",
+    "PreviousStepFormatError",
+    "PreviousStepStatusError",
+    "ResponseAlreadyComputedError",
+    "RowsPostProcessingError",
+    "SplitsNamesError",
+    "SplitNamesFromStreamingError",
+    "SplitNotFoundError",
+    "SplitWithTooBigParquetError",
+    "StreamingRowsError",
+    "TooBigContentError",
+    "TooManyColumnsError",
+    "UnexpectedError",
+    "UnsupportedExternalFilesError",
+]
+
+
+class CacheableError(CustomError):
+    """Base class for exceptions that can be cached in the database."""
+
+    def __init__(
+        self,
+        message: str,
+        status_code: HTTPStatus,
+        code: CacheableErrorCode,
+        cause: Optional[BaseException] = None,
+        disclose_cause: bool = False,
+    ):
+        super().__init__(
+            message=message, status_code=status_code, code=code, cause=cause, disclose_cause=disclose_cause
+        )
+
+
+class CacheDirectoryNotInitializedError(CacheableError):
+    """The cache directory has not been initialized before job compute."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "CacheDirectoryNotInitializedError", cause, True)
+
+
+class ConfigNamesError(CacheableError):
+    """The config names could not be fetched."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "ConfigNamesError", cause, True)
+
+
+class CreateCommitError(CacheableError):
+    """A commit could not be created on the Hub."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "CreateCommitError", cause, False)
+
+
+class DatasetInBlockListError(CacheableError):
+    """The dataset is in the list of blocked datasets."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "DatasetInBlockListError", cause, False)
+
+
+class DatasetInfoHubRequestError(CacheableError):
+    """The request to the Hub's dataset-info endpoint times out."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(
+            message=message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            code="DatasetInfoHubRequestError",
+            cause=cause,
+            disclose_cause=False,
+        )
+
+
+class DatasetManualDownloadError(CacheableError):
+    """The dataset requires manual download."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "DatasetManualDownloadError", cause, True)
+
+
+class DatasetModuleNotInstalledError(CacheableError):
+    """The dataset tries to import a module that is not installed."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "DatasetModuleNotInstalledError", cause, True)
+
+
+class DatasetNotFoundError(CacheableError):
+    """The dataset does not exist."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(
+            message=message,
+            status_code=HTTPStatus.NOT_FOUND,
+            code="DatasetNotFoundError",
+            cause=cause,
+            disclose_cause=False,
+        )
+
+
+class DatasetRevisionEmptyError(CacheableError):
+    """The current git revision (branch, commit) could not be obtained."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "DatasetRevisionEmptyError", cause, False)
+
+
+class DatasetRevisionNotFoundError(CacheableError):
+    """The revision of a dataset repository does not exist."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_FOUND, "DatasetRevisionNotFoundError", cause, False)
+
+
+class DatasetWithTooManyConfigsError(CacheableError):
+    """The number of configs of a dataset exceeded the limit."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "DatasetWithTooManyConfigsError", cause, True)
+
+
+class DatasetWithTooManyParquetFilesError(CacheableError):
+    """The number of parquet files of a dataset is too big."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "DatasetWithTooManyParquetFilesError", cause, True)
+
+
+class DuckDBIndexFileNotFoundError(CacheableError):
+    """No duckdb index file was found for split."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "DuckDBIndexFileNotFoundError", cause, False)
+
+
+class DisabledViewerError(CacheableError):
+    """The dataset viewer is disabled."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(
+            message=message,
+            status_code=HTTPStatus.NOT_FOUND,
+            code="DisabledViewerError",
+            cause=cause,
+            disclose_cause=False,
+        )
+
+
+class EmptyDatasetError(CacheableError):
+    """The dataset has no data."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "EmptyDatasetError", cause, True)
+
+
+class ExternalFilesSizeRequestConnectionError(CacheableError):
+    """We failed to get the size of the external files."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "ExternalFilesSizeRequestConnectionError", cause, True)
+
+
+class ExternalFilesSizeRequestError(CacheableError):
+    """We failed to get the size of the external files."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "ExternalFilesSizeRequestError", cause, True)
+
+
+class ExternalFilesSizeRequestHTTPError(CacheableError):
+    """We failed to get the size of the external files."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "ExternalFilesSizeRequestHTTPError", cause, True)
+
+
+class ExternalFilesSizeRequestTimeoutError(CacheableError):
+    """We failed to get the size of the external files."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "ExternalFilesSizeRequestTimeoutError", cause, True)
+
+
+class ExternalServerError(CacheableError):
+    """The spawning.ai server is not responding."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "ExternalServerError", cause, False)
+
+
+class FeaturesError(CacheableError):
+    """The features could not be fetched."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "FeaturesError", cause, True)
+
+
+class FileSystemError(CacheableError):
+    """An error happen reading from File System."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "FileSystemError", cause, False)
+
+
+class InfoError(CacheableError):
+    """The info could not be fetched."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "InfoError", cause, True)
+
+
+class JobManagerCrashedError(CacheableError):
+    """The job runner crashed and the job became a zombie."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(
+            message=message,
+            status_code=HTTPStatus.NOT_IMPLEMENTED,
+            code="JobManagerCrashedError",
+            cause=cause,
+            disclose_cause=False,
+        )
+
+
+class JobManagerExceededMaximumDurationError(CacheableError):
+    """The job runner was killed because the job exceeded the maximum duration."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(
+            message=message,
+            status_code=HTTPStatus.NOT_IMPLEMENTED,
+            code="JobManagerExceededMaximumDurationError",
+            cause=cause,
+            disclose_cause=False,
+        )
+
+
+class LockedDatasetTimeoutError(CacheableError):
+    """A dataset is locked by another job."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "LockedDatasetTimeoutError", cause, True)
+
+
+class MissingSpawningTokenError(CacheableError):
+    """The spawning.ai token is not set."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "MissingSpawningTokenError", cause, False)
+
+
+class NormalRowsError(CacheableError):
+    """The rows could not be fetched in normal mode."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "NormalRowsError", cause, True)
+
+
+class NoIndexableColumnsError(CacheableError):
+    """The split does not have string columns to index."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "NoIndexableColumnsError", cause, True)
+
+
+class NoSupportedFeaturesError(CacheableError):
+    """The dataset does not have any features which types are supported by a worker's processing pipeline."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "NoSupportedFeaturesError", cause, True)
+
+
+class ParameterMissingError(CacheableError):
+    """The request is missing some parameter."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(
+            message=message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            code="ParameterMissingError",
+            cause=cause,
+            disclose_cause=False,
+        )
+
+
+class ParquetResponseEmptyError(CacheableError):
+    """No parquet files were found for split."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "ParquetResponseEmptyError", cause, False)
+
+
+class PreviousStepFormatError(CacheableError):
+    """The content of the previous step has not the expected format."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "PreviousStepFormatError", cause, False)
+
+
+class PreviousStepStatusError(CacheableError):
+    """The previous step gave an error. The job should not have been created."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "PreviousStepStatusError", cause, False)
+
+
+class ResponseAlreadyComputedError(CacheableError):
+    """The response has been already computed by another job runner."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(
+            message=message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            code="ResponseAlreadyComputedError",
+            cause=cause,
+            disclose_cause=True,
+        )
+
+
+class RowsPostProcessingError(CacheableError):
+    """The rows could not be post-processed successfully."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "RowsPostProcessingError", cause, False)
+
+
+class SplitsNamesError(CacheableError):
+    """The split names could not be fetched."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "SplitsNamesError", cause, True)
+
+
+class SplitNamesFromStreamingError(CacheableError):
+    """The split names could not be fetched."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "SplitNamesFromStreamingError", cause, True)
+
+
+class SplitNotFoundError(CacheableError):
+    """The split does not exist."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(
+            message=message,
+            status_code=HTTPStatus.NOT_FOUND,
+            code="SplitNotFoundError",
+            cause=cause,
+            disclose_cause=False,
+        )
+
+
+class SplitWithTooBigParquetError(CacheableError):
+    """The split parquet size (sum of parquet sizes given) is too big."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "SplitWithTooBigParquetError", cause, False)
+
+
+class StreamingRowsError(CacheableError):
+    """The rows could not be fetched in streaming mode."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "StreamingRowsError", cause, True)
+
+
+class TooBigContentError(CacheableError):
+    """The content size in bytes is bigger than the supported value."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(
+            message=message,
+            status_code=HTTPStatus.NOT_IMPLEMENTED,
+            code="TooBigContentError",
+            cause=cause,
+            disclose_cause=False,
+        )
+
+
+class TooManyColumnsError(CacheableError):
+    """The dataset exceeded the max number of columns."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "TooManyColumnsError", cause, True)
+
+
+class UnexpectedError(CacheableError):
+    """The job runner raised an unexpected error."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(
+            message=message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            code="UnexpectedError",
+            cause=cause,
+            disclose_cause=False,
+        )
+        logging.error(message, exc_info=cause)
+
+
+class UnsupportedExternalFilesError(CacheableError):
+    """We failed to get the size of the external files."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.NOT_IMPLEMENTED, "UnsupportedExternalFilesError", cause, True)
+
+
+class StatisticsComputationError(CacheableError):
+    """An unexpected behavior or error occurred during statistics computations."""
+
+    def __init__(self, message: str, cause: Optional[BaseException] = None):
+        super().__init__(message, HTTPStatus.INTERNAL_SERVER_ERROR, "ComputationError", cause, True)

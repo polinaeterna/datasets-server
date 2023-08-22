@@ -7,6 +7,7 @@ from datetime import datetime
 from http import HTTPStatus
 from typing import (
     Any,
+    Dict,
     Generic,
     List,
     Mapping,
@@ -16,11 +17,14 @@ from typing import (
     Type,
     TypedDict,
     TypeVar,
+    overload,
 )
 
+import pandas as pd
 from bson import ObjectId
 from bson.errors import InvalidId
-from mongoengine import Document, DoesNotExist
+from mongoengine import Document
+from mongoengine.errors import DoesNotExist
 from mongoengine.fields import (
     DateTimeField,
     DictField,
@@ -32,8 +36,12 @@ from mongoengine.fields import (
 )
 from mongoengine.queryset.queryset import QuerySet
 
-from libcommon.constants import CACHE_COLLECTION_RESPONSES, CACHE_MONGOENGINE_ALIAS
-from libcommon.utils import get_datetime
+from libcommon.constants import (
+    CACHE_COLLECTION_RESPONSES,
+    CACHE_METRICS_COLLECTION,
+    CACHE_MONGOENGINE_ALIAS,
+)
+from libcommon.utils import JobParams, get_datetime
 
 # START monkey patching ### hack ###
 # see https://github.com/sbdchd/mongo-types#install
@@ -64,7 +72,7 @@ class SplitFullName(NamedTuple):
 
 
 # cache of any job
-class CachedResponse(Document):
+class CachedResponseDocument(Document):
     """A response computed for a job, cached in the mongoDB database
 
     Args:
@@ -105,20 +113,79 @@ class CachedResponse(Document):
         "indexes": [
             ("kind", "dataset", "config", "split"),
             ("dataset", "kind", "http_status"),
-            ("kind", "http_status", "dataset"),
             ("kind", "http_status", "error_code"),
-            ("kind", "id"),
         ],
     }
-    objects = QuerySetManager["CachedResponse"]()
+    objects = QuerySetManager["CachedResponseDocument"]()
+
+
+DEFAULT_INCREASE_AMOUNT = 1
+DEFAULT_DECREASE_AMOUNT = -1
+
+
+class CacheTotalMetricDocument(Document):
+    """Cache total metric in the mongoDB database, used to compute prometheus metrics.
+
+    Args:
+        kind (`str`): kind name
+        http_status (`int`): cache http_status
+        error_code (`str`): error code name
+        total (`int`): total of jobs
+        created_at (`datetime`): when the metric has been created.
+    """
+
+    id = ObjectIdField(db_field="_id", primary_key=True, default=ObjectId)
+    kind = StringField(required=True)
+    http_status = IntField(required=True)
+    error_code = StringField()
+    total = IntField(required=True, default=0)
+    created_at = DateTimeField(default=get_datetime)
+
+    meta = {
+        "collection": CACHE_METRICS_COLLECTION,
+        "db_alias": CACHE_MONGOENGINE_ALIAS,
+        "indexes": [
+            {
+                "fields": ["kind", "http_status", "error_code"],
+                "unique": True,
+            }
+        ],
+    }
+    objects = QuerySetManager["CacheTotalMetricDocument"]()
 
 
 # Fix issue with mongoengine: https://github.com/MongoEngine/mongoengine/issues/1242#issuecomment-810501601
 # mongoengine automatically sets "config" and "splits" as required fields, because they are listed in the unique_with
 # field of the "kind" field. But it's an error, since unique indexes (which are used to enforce unique_with) accept
 # null values, see https://www.mongodb.com/docs/v5.0/core/index-unique/#unique-index-and-missing-field.
-CachedResponse.config.required = False  # type: ignore
-CachedResponse.split.required = False  # type: ignore
+CachedResponseDocument.config.required = False  # type: ignore
+CachedResponseDocument.split.required = False  # type: ignore
+
+
+class CacheEntryDoesNotExistError(DoesNotExist):
+    pass
+
+
+def _update_metrics(kind: str, http_status: HTTPStatus, increase_by: int, error_code: Optional[str] = None) -> None:
+    CacheTotalMetricDocument.objects(kind=kind, http_status=http_status, error_code=error_code).upsert_one(
+        inc__total=increase_by
+    )
+
+
+def increase_metric(kind: str, http_status: HTTPStatus, error_code: Optional[str] = None) -> None:
+    _update_metrics(kind=kind, http_status=http_status, error_code=error_code, increase_by=DEFAULT_INCREASE_AMOUNT)
+
+
+def decrease_metric(kind: str, http_status: HTTPStatus, error_code: Optional[str] = None) -> None:
+    _update_metrics(kind=kind, http_status=http_status, error_code=error_code, increase_by=DEFAULT_DECREASE_AMOUNT)
+
+
+def decrease_metric_for_artifact(kind: str, dataset: str, config: Optional[str], split: Optional[str]) -> None:
+    try:
+        existing_cache = CachedResponseDocument.objects(kind=kind, dataset=dataset, config=config, split=split).get()
+    except DoesNotExist:
+        return
+    decrease_metric(kind=kind, http_status=existing_cache.http_status, error_code=existing_cache.error_code)
 
 
 # Note: we let the exceptions throw (ie DocumentTooLarge): it's the responsibility of the caller to manage them
@@ -136,7 +203,8 @@ def upsert_response(
     progress: Optional[float] = None,
     updated_at: Optional[datetime] = None,
 ) -> None:
-    CachedResponse.objects(kind=kind, dataset=dataset, config=config, split=split).upsert_one(
+    decrease_metric_for_artifact(kind=kind, dataset=dataset, config=config, split=split)
+    CachedResponseDocument.objects(kind=kind, dataset=dataset, config=config, split=split).upsert_one(
         content=content,
         http_status=http_status,
         error_code=error_code,
@@ -146,16 +214,78 @@ def upsert_response(
         updated_at=updated_at or get_datetime(),
         job_runner_version=job_runner_version,
     )
+    increase_metric(kind=kind, http_status=http_status, error_code=error_code)
+
+
+def upsert_response_params(
+    kind: str,
+    job_params: JobParams,
+    content: Mapping[str, Any],
+    http_status: HTTPStatus,
+    error_code: Optional[str] = None,
+    details: Optional[Mapping[str, Any]] = None,
+    job_runner_version: Optional[int] = None,
+    progress: Optional[float] = None,
+    updated_at: Optional[datetime] = None,
+) -> None:
+    upsert_response(
+        kind=kind,
+        dataset=job_params["dataset"],
+        config=job_params["config"],
+        split=job_params["split"],
+        content=content,
+        dataset_git_revision=job_params["revision"],
+        details=details,
+        error_code=error_code,
+        http_status=http_status,
+        job_runner_version=job_runner_version,
+        progress=progress,
+        updated_at=updated_at,
+    )
 
 
 def delete_response(
     kind: str, dataset: str, config: Optional[str] = None, split: Optional[str] = None
 ) -> Optional[int]:
-    return CachedResponse.objects(kind=kind, dataset=dataset, config=config, split=split).delete()
+    decrease_metric_for_artifact(kind=kind, dataset=dataset, config=config, split=split)
+    return CachedResponseDocument.objects(kind=kind, dataset=dataset, config=config, split=split).delete()
 
 
 def delete_dataset_responses(dataset: str) -> Optional[int]:
-    return CachedResponse.objects(dataset=dataset).delete()
+    existing_cache = CachedResponseDocument.objects(dataset=dataset)
+    for cache in existing_cache:
+        decrease_metric(kind=cache.kind, http_status=cache.http_status, error_code=cache.error_code)
+    return existing_cache.delete()
+
+
+T = TypeVar("T")
+
+
+@overload
+def _clean_nested_mongo_object(obj: Dict[str, T]) -> Dict[str, T]:
+    ...
+
+
+@overload
+def _clean_nested_mongo_object(obj: List[T]) -> List[T]:
+    ...
+
+
+@overload
+def _clean_nested_mongo_object(obj: T) -> T:
+    ...
+
+
+def _clean_nested_mongo_object(obj: Any) -> Any:
+    """get rid of BaseDict and BaseList objects from mongo (Feature.from_dict doesn't support them)"""
+    if isinstance(obj, dict):
+        return {k: _clean_nested_mongo_object(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_clean_nested_mongo_object(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_clean_nested_mongo_object(v) for v in obj)
+    else:
+        return obj
 
 
 class CacheEntryWithoutContent(TypedDict):
@@ -166,15 +296,18 @@ class CacheEntryWithoutContent(TypedDict):
     job_runner_version: Optional[int]
 
 
-# Note: we let the exceptions throw (ie DoesNotExist): it's the responsibility of the caller to manage them
+# Note: we let the exceptions throw: it's the responsibility of the caller to manage them
 def get_response_without_content(
     kind: str, dataset: str, config: Optional[str] = None, split: Optional[str] = None
 ) -> CacheEntryWithoutContent:
-    response = (
-        CachedResponse.objects(kind=kind, dataset=dataset, config=config, split=split)
-        .only("http_status", "error_code", "job_runner_version", "dataset_git_revision", "progress")
-        .get()
-    )
+    try:
+        response = (
+            CachedResponseDocument.objects(kind=kind, dataset=dataset, config=config, split=split)
+            .only("http_status", "error_code", "job_runner_version", "dataset_git_revision", "progress")
+            .get()
+        )
+    except DoesNotExist as e:
+        raise CacheEntryDoesNotExistError(f"Cache entry does not exist: {kind=} {dataset=} {config=} {split=}") from e
     return {
         "http_status": response.http_status,
         "error_code": response.error_code,
@@ -184,19 +317,28 @@ def get_response_without_content(
     }
 
 
+def get_response_without_content_params(kind: str, job_params: JobParams) -> CacheEntryWithoutContent:
+    return get_response_without_content(
+        kind=kind, dataset=job_params["dataset"], config=job_params["config"], split=job_params["split"]
+    )
+
+
 class CacheEntryMetadata(CacheEntryWithoutContent):
     updated_at: datetime
 
 
-# Note: we let the exceptions throw (ie DoesNotExist): it's the responsibility of the caller to manage them
+# Note: we let the exceptions throw: it's the responsibility of the caller to manage them
 def get_response_metadata(
     kind: str, dataset: str, config: Optional[str] = None, split: Optional[str] = None
 ) -> CacheEntryMetadata:
-    response = (
-        CachedResponse.objects(kind=kind, dataset=dataset, config=config, split=split)
-        .only("http_status", "error_code", "job_runner_version", "dataset_git_revision", "progress", "updated_at")
-        .get()
-    )
+    try:
+        response = (
+            CachedResponseDocument.objects(kind=kind, dataset=dataset, config=config, split=split)
+            .only("http_status", "error_code", "job_runner_version", "dataset_git_revision", "progress", "updated_at")
+            .get()
+        )
+    except DoesNotExist as e:
+        raise CacheEntryDoesNotExistError(f"Cache entry does not exist: {kind=} {dataset=} {config=} {split=}") from e
     return {
         "http_status": response.http_status,
         "error_code": response.error_code,
@@ -215,15 +357,50 @@ class CacheEntryWithDetails(CacheEntry):
     details: Mapping[str, str]
 
 
-# Note: we let the exceptions throw (ie DoesNotExist): it's the responsibility of the caller to manage them
+class CachedArtifactError(Exception):
+    kind: str
+    dataset: str
+    config: Optional[str]
+    split: Optional[str]
+    cache_entry_with_details: CacheEntryWithDetails
+    enhanced_details: Dict[str, Any]
+
+    def __init__(
+        self,
+        message: str,
+        kind: str,
+        dataset: str,
+        config: Optional[str],
+        split: Optional[str],
+        cache_entry_with_details: CacheEntryWithDetails,
+    ):
+        super().__init__(message)
+        self.kind = kind
+        self.dataset = dataset
+        self.config = config
+        self.split = split
+        self.cache_entry_with_details = cache_entry_with_details
+        self.enhanced_details: Dict[str, Any] = dict(self.cache_entry_with_details["details"].items())
+        self.enhanced_details["copied_from_artifact"] = {
+            "kind": self.kind,
+            "dataset": self.dataset,
+            "config": self.config,
+            "split": self.split,
+        }
+
+
+# Note: we let the exceptions throw: it's the responsibility of the caller to manage them
 def get_response(kind: str, dataset: str, config: Optional[str] = None, split: Optional[str] = None) -> CacheEntry:
-    response = (
-        CachedResponse.objects(kind=kind, dataset=dataset, config=config, split=split)
-        .only("content", "http_status", "error_code", "job_runner_version", "dataset_git_revision", "progress")
-        .get()
-    )
+    try:
+        response = (
+            CachedResponseDocument.objects(kind=kind, dataset=dataset, config=config, split=split)
+            .only("content", "http_status", "error_code", "job_runner_version", "dataset_git_revision", "progress")
+            .get()
+        )
+    except DoesNotExist as e:
+        raise CacheEntryDoesNotExistError(f"Cache entry does not exist: {kind=} {dataset=} {config=} {split=}") from e
     return {
-        "content": response.content,
+        "content": _clean_nested_mongo_object(response.content),
         "http_status": response.http_status,
         "error_code": response.error_code,
         "job_runner_version": response.job_runner_version,
@@ -232,26 +409,38 @@ def get_response(kind: str, dataset: str, config: Optional[str] = None, split: O
     }
 
 
-# Note: we let the exceptions throw (ie DoesNotExist): it's the responsibility of the caller to manage them
+# Note: we let the exceptions throw: it's the responsibility of the caller to manage them
 def get_response_with_details(
     kind: str, dataset: str, config: Optional[str] = None, split: Optional[str] = None
 ) -> CacheEntryWithDetails:
-    response = (
-        CachedResponse.objects(kind=kind, dataset=dataset, config=config, split=split)
-        .only(
-            "content", "http_status", "error_code", "job_runner_version", "dataset_git_revision", "progress", "details"
+    try:
+        response = (
+            CachedResponseDocument.objects(kind=kind, dataset=dataset, config=config, split=split)
+            .only(
+                "content",
+                "http_status",
+                "error_code",
+                "job_runner_version",
+                "dataset_git_revision",
+                "progress",
+                "details",
+            )
+            .get()
         )
-        .get()
-    )
+    except DoesNotExist as e:
+        raise CacheEntryDoesNotExistError(f"Cache entry does not exist: {kind=} {dataset=} {config=} {split=}") from e
     return {
-        "content": response.content,
+        "content": _clean_nested_mongo_object(response.content),
         "http_status": response.http_status,
         "error_code": response.error_code,
         "job_runner_version": response.job_runner_version,
         "dataset_git_revision": response.dataset_git_revision,
         "progress": response.progress,
-        "details": response.details,
+        "details": _clean_nested_mongo_object(response.details),
     }
+
+
+CACHED_RESPONSE_NOT_FOUND = "CachedResponseNotFound"
 
 
 def get_response_or_missing_error(
@@ -259,7 +448,7 @@ def get_response_or_missing_error(
 ) -> CacheEntryWithDetails:
     try:
         response = get_response_with_details(kind=kind, dataset=dataset, config=config, split=split)
-    except DoesNotExist:
+    except CacheEntryDoesNotExistError:
         response = CacheEntryWithDetails(
             content={
                 "error": (
@@ -267,7 +456,7 @@ def get_response_or_missing_error(
                 )
             },
             http_status=HTTPStatus.NOT_FOUND,
-            error_code="CachedResponseNotFound",
+            error_code=CACHED_RESPONSE_NOT_FOUND,
             dataset_git_revision=None,
             job_runner_version=None,
             progress=None,
@@ -330,21 +519,36 @@ def get_best_response(
     return best_response_candidates[max_index]
 
 
+def get_previous_step_or_raise(
+    kinds: List[str], dataset: str, config: Optional[str] = None, split: Optional[str] = None
+) -> BestResponse:
+    """Get the previous step from the cache, or raise an exception if it failed."""
+    best_response = get_best_response(kinds=kinds, dataset=dataset, config=config, split=split)
+    if best_response.response["http_status"] != HTTPStatus.OK:
+        raise CachedArtifactError(
+            message="The previous step failed.",
+            kind=best_response.kind,
+            dataset=dataset,
+            config=config,
+            split=split,
+            cache_entry_with_details=best_response.response,
+        )
+    return best_response
+
+
 def get_valid_datasets(kind: str) -> Set[str]:
-    return set(CachedResponse.objects(kind=kind, http_status=HTTPStatus.OK).distinct("dataset"))
+    return set(CachedResponseDocument.objects(kind=kind, http_status=HTTPStatus.OK).distinct("dataset"))
 
 
-def get_validity_by_kind(dataset: str, kinds: Optional[List[str]] = None) -> Mapping[str, bool]:
-    # TODO: rework with aggregate
-    entries = (
-        CachedResponse.objects(dataset=dataset)
-        if kinds is None
-        else CachedResponse.objects(dataset=dataset, kind__in=kinds)
-    ).only("kind", "http_status")
-    return {
-        str(kind): entries(kind=kind, http_status=HTTPStatus.OK).first() is not None
-        for kind in sorted(entries.distinct("kind"))
-    }
+def has_any_successful_response(
+    kinds: List[str], dataset: str, config: Optional[str] = None, split: Optional[str] = None
+) -> bool:
+    return (
+        CachedResponseDocument.objects(
+            dataset=dataset, config=config, split=split, kind__in=kinds, http_status=HTTPStatus.OK
+        ).count()
+        > 0
+    )
 
 
 # admin /metrics endpoint
@@ -357,23 +561,43 @@ class CountEntry(TypedDict):
     count: int
 
 
+def format_group(group: Dict[str, Any]) -> CountEntry:
+    kind = group["kind"]
+    if not isinstance(kind, str):
+        raise TypeError("kind must be a str")
+    http_status = group["http_status"]
+    if not isinstance(http_status, int):
+        raise TypeError("http_status must be an int")
+    error_code = group["error_code"]
+    if not isinstance(error_code, str) and error_code is not None:
+        raise TypeError("error_code must be a str or None")
+    count = group["count"]
+    if not isinstance(count, int):
+        raise TypeError("count must be an int")
+    return {"kind": kind, "http_status": http_status, "error_code": error_code, "count": count}
+
+
 def get_responses_count_by_kind_status_and_error_code() -> List[CountEntry]:
-    # TODO: rework with aggregate
-    # see
-    # https://stackoverflow.com/questions/47301829/mongodb-distinct-count-for-combination-of-two-fields?noredirect=1&lq=1#comment81555081_47301829
-    # and https://docs.mongoengine.org/guide/querying.html#mongodb-aggregation-api
-    entries = CachedResponse.objects().only("kind", "http_status", "error_code")
-    return [
-        {
-            "kind": str(kind),
-            "http_status": int(http_status),
-            "error_code": error_code,
-            "count": entries(kind=kind, http_status=http_status, error_code=error_code).count(),
-        }
-        for kind in sorted(entries.distinct("kind"))
-        for http_status in sorted(entries(kind=kind).distinct("http_status"))
-        for error_code in entries(kind=kind, http_status=http_status).distinct("error_code")
-    ]
+    groups = CachedResponseDocument.objects().aggregate(
+        [
+            {"$sort": {"kind": 1, "http_status": 1, "error_code": 1}},
+            {
+                "$group": {
+                    "_id": {"kind": "$kind", "http_status": "$http_status", "error_code": "$error_code"},
+                    "count": {"$sum": 1},
+                }
+            },
+            {
+                "$project": {
+                    "kind": "$_id.kind",
+                    "http_status": "$_id.http_status",
+                    "error_code": "$_id.error_code",
+                    "count": "$count",
+                }
+            },
+        ]
+    )
+    return [format_group(group) for group in groups]
 
 
 # /cache-reports/... endpoints
@@ -424,19 +648,17 @@ def get_cache_reports(kind: str, cursor: Optional[str], limit: int) -> CacheRepo
     Returns:
         [`CacheReportsPage`]: A dict with the list of reports and the next cursor. The next cursor is
         an empty string if there are no more items to be fetched.
-    <Tip>
     Raises the following errors:
-        - [`~libcommon.simple_cache.InvalidCursor`]
+        - [`~simple_cache.InvalidCursor`]
           If the cursor is invalid.
-        - [`~libcommon.simple_cache.InvalidLimit`]
+        - [`~simple_cache.InvalidLimit`]
           If the limit is an invalid number.
-    </Tip>
     """
     if not cursor:
-        queryset = CachedResponse.objects(kind=kind)
+        queryset = CachedResponseDocument.objects(kind=kind)
     else:
         try:
-            queryset = CachedResponse.objects(kind=kind, id__gt=ObjectId(cursor))
+            queryset = CachedResponseDocument.objects(kind=kind, id__gt=ObjectId(cursor))
         except InvalidId as err:
             raise InvalidCursor("Invalid cursor.") from err
     if limit <= 0:
@@ -451,7 +673,7 @@ def get_cache_reports(kind: str, cursor: Optional[str], limit: int) -> CacheRepo
                 "split": object.split,
                 "http_status": object.http_status.value,
                 "error_code": object.error_code,
-                "details": object.details,
+                "details": _clean_nested_mongo_object(object.details),
                 "updated_at": object.updated_at,
                 "job_runner_version": object.job_runner_version,
                 "dataset_git_revision": object.dataset_git_revision,
@@ -464,7 +686,7 @@ def get_cache_reports(kind: str, cursor: Optional[str], limit: int) -> CacheRepo
 
 
 def get_outdated_split_full_names_for_step(kind: str, current_version: int) -> List[SplitFullName]:
-    responses = CachedResponse.objects(kind=kind, job_runner_version__lt=current_version).only(
+    responses = CachedResponseDocument.objects(kind=kind, job_runner_version__lt=current_version).only(
         "dataset", "config", "split"
     )
     return [
@@ -473,7 +695,7 @@ def get_outdated_split_full_names_for_step(kind: str, current_version: int) -> L
 
 
 def get_dataset_responses_without_content_for_kind(kind: str, dataset: str) -> List[CacheReport]:
-    responses = CachedResponse.objects(kind=kind, dataset=dataset).exclude("content")
+    responses = CachedResponseDocument.objects(kind=kind, dataset=dataset).exclude("content")
     return [
         {
             "kind": response.kind,
@@ -482,7 +704,7 @@ def get_dataset_responses_without_content_for_kind(kind: str, dataset: str) -> L
             "split": response.split,
             "http_status": response.http_status,
             "error_code": response.error_code,
-            "details": response.details,
+            "details": _clean_nested_mongo_object(response.details),
             "updated_at": response.updated_at,
             "job_runner_version": response.job_runner_version,
             "dataset_git_revision": response.dataset_git_revision,
@@ -519,19 +741,17 @@ def get_cache_reports_with_content(kind: str, cursor: Optional[str], limit: int)
     Returns:
         [`CacheReportsWithContentPage`]: A dict with the list of reports and the next cursor. The next cursor is
         an empty string if there are no more items to be fetched.
-    <Tip>
     Raises the following errors:
-        - [`~libcommon.simple_cache.InvalidCursor`]
+        - [`~simple_cache.InvalidCursor`]
           If the cursor is invalid.
-        - [`~libcommon.simple_cache.InvalidLimit`]
+        - [`~simple_cache.InvalidLimit`]
           If the limit is an invalid number.
-    </Tip>
     """
     if not cursor:
-        queryset = CachedResponse.objects(kind=kind)
+        queryset = CachedResponseDocument.objects(kind=kind)
     else:
         try:
-            queryset = CachedResponse.objects(kind=kind, id__gt=ObjectId(cursor))
+            queryset = CachedResponseDocument.objects(kind=kind, id__gt=ObjectId(cursor))
         except InvalidId as err:
             raise InvalidCursor("Invalid cursor.") from err
     if limit <= 0:
@@ -546,10 +766,10 @@ def get_cache_reports_with_content(kind: str, cursor: Optional[str], limit: int)
                 "split": object.split,
                 "http_status": object.http_status.value,
                 "error_code": object.error_code,
-                "content": object.content,
+                "content": _clean_nested_mongo_object(object.content),
                 "job_runner_version": object.job_runner_version,
                 "dataset_git_revision": object.dataset_git_revision,
-                "details": object.details,
+                "details": _clean_nested_mongo_object(object.details),
                 "updated_at": object.updated_at,
                 "progress": object.progress,
             }
@@ -559,10 +779,106 @@ def get_cache_reports_with_content(kind: str, cursor: Optional[str], limit: int)
     }
 
 
+class CacheEntryFullMetadata(CacheEntryMetadata):
+    kind: str
+    dataset: str
+    config: Optional[str]
+    split: Optional[str]
+
+
+def _get_df(entries: List[CacheEntryFullMetadata]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "kind": pd.Series([entry["kind"] for entry in entries], dtype="category"),
+            "dataset": pd.Series([entry["dataset"] for entry in entries], dtype="str"),
+            "config": pd.Series([entry["config"] for entry in entries], dtype="str"),
+            "split": pd.Series([entry["split"] for entry in entries], dtype="str"),
+            "http_status": pd.Series(
+                [entry["http_status"] for entry in entries], dtype="category"
+            ),  # check if it's working as expected
+            "error_code": pd.Series([entry["error_code"] for entry in entries], dtype="category"),
+            "dataset_git_revision": pd.Series([entry["dataset_git_revision"] for entry in entries], dtype="str"),
+            "job_runner_version": pd.Series([entry["job_runner_version"] for entry in entries], dtype=pd.Int16Dtype()),
+            "progress": pd.Series([entry["progress"] for entry in entries], dtype="float"),
+            "updated_at": pd.Series(
+                [entry["updated_at"] for entry in entries], dtype="datetime64[ns]"
+            ),  # check if it's working as expected
+        }
+    )
+    # ^ does not seem optimal at all, but I get the types right
+
+
+def get_cache_entries_df(dataset: str, cache_kinds: Optional[List[str]] = None) -> pd.DataFrame:
+    filters = {}
+    if cache_kinds:
+        filters["kind__in"] = cache_kinds
+    return _get_df(
+        [
+            {
+                "kind": response.kind,
+                "dataset": response.dataset,
+                "config": response.config,
+                "split": response.split,
+                "http_status": response.http_status,
+                "error_code": response.error_code,
+                "dataset_git_revision": response.dataset_git_revision,
+                "job_runner_version": response.job_runner_version,
+                "progress": response.progress,
+                "updated_at": response.updated_at,
+            }
+            for response in CachedResponseDocument.objects(dataset=dataset, **filters).only(
+                "kind",
+                "dataset",
+                "config",
+                "split",
+                "http_status",
+                "error_code",
+                "job_runner_version",
+                "dataset_git_revision",
+                "progress",
+                "updated_at",
+            )
+        ]
+    )
+
+
+def has_some_cache(dataset: str) -> bool:
+    return CachedResponseDocument.objects(dataset=dataset).count() > 0
+
+
+def fetch_names(
+    dataset: str, config: Optional[str], cache_kinds: List[str], names_field: str, name_field: str
+) -> List[str]:
+    """
+    Fetch a list of names from the cache database.
+
+    If no entry is found in cache, return an empty list. Exceptions are silently caught.
+
+    Args:
+        dataset (str): The dataset name.
+        config (Optional[str]): The config name. Only needed for split names.
+        cache_kinds (List[str]): The cache kinds to fetch, eg ["dataset-config-names"],
+          or ["config-split-names-from-streaming", "config-split-names-from-info"].
+        names_field (str): The name of the field containing the list of names, eg: "config_names", or "splits".
+        name_field (str): The name of the field containing the name, eg: "config", or "split".
+
+    Returns:
+        List[str]: The list of names.
+    """
+    try:
+        names = []
+        best_response = get_best_response(kinds=cache_kinds, dataset=dataset, config=config)
+        for name_item in best_response.response["content"][names_field]:
+            name = name_item[name_field]
+            if not isinstance(name, str):
+                raise ValueError(f"Invalid name: {name}, type should be str, got: {type(name)}")
+            names.append(name)
+        return names
+    except Exception:
+        return []
+
+
 # only for the tests
 def _clean_cache_database() -> None:
-    CachedResponse.drop_collection()  # type: ignore
-
-
-# explicit re-export
-__all__ = ["DoesNotExist"]
+    CachedResponseDocument.drop_collection()  # type: ignore
+    CacheTotalMetricDocument.drop_collection()  # type: ignore

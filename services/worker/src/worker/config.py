@@ -10,12 +10,14 @@ from libcommon.config import (
     CacheConfig,
     CommonConfig,
     LogConfig,
+    ParquetMetadataConfig,
     ProcessingGraphConfig,
     QueueConfig,
 )
 
 WORKER_CONTENT_MAX_BYTES = 10_000_000
-WORKER_ENDPOINT = "/config-names"
+WORKER_DIFFICULTY_MAX = None
+WORKER_DIFFICULTY_MIN = None
 WORKER_HEARTBEAT_INTERVAL_SECONDS = 60
 WORKER_KILL_LONG_JOB_INTERVAL_SECONDS = 60
 WORKER_KILL_ZOMBIES_INTERVAL_SECONDS = 10 * 60
@@ -35,17 +37,19 @@ def get_empty_str_list() -> List[str]:
 @dataclass(frozen=True)
 class WorkerConfig:
     content_max_bytes: int = WORKER_CONTENT_MAX_BYTES
-    heartbeat_interval_seconds: int = WORKER_HEARTBEAT_INTERVAL_SECONDS
+    difficulty_max: Optional[int] = WORKER_DIFFICULTY_MAX
+    difficulty_min: Optional[int] = WORKER_DIFFICULTY_MIN
+    heartbeat_interval_seconds: float = WORKER_HEARTBEAT_INTERVAL_SECONDS
     job_types_blocked: list[str] = field(default_factory=get_empty_str_list)
     job_types_only: list[str] = field(default_factory=get_empty_str_list)
-    kill_long_job_interval_seconds: int = WORKER_KILL_LONG_JOB_INTERVAL_SECONDS
-    kill_zombies_interval_seconds: int = WORKER_KILL_ZOMBIES_INTERVAL_SECONDS
+    kill_long_job_interval_seconds: float = WORKER_KILL_LONG_JOB_INTERVAL_SECONDS
+    kill_zombies_interval_seconds: float = WORKER_KILL_ZOMBIES_INTERVAL_SECONDS
     max_disk_usage_pct: int = WORKER_MAX_DISK_USAGE_PCT
-    max_job_duration_seconds: int = WORKER_MAX_JOB_DURATION_SECONDS
+    max_job_duration_seconds: float = WORKER_MAX_JOB_DURATION_SECONDS
     max_load_pct: int = WORKER_MAX_LOAD_PCT
     max_memory_pct: int = WORKER_MAX_MEMORY_PCT
     max_missing_heartbeats: int = WORKER_MAX_MISSING_HEARTBEATS
-    sleep_seconds: int = WORKER_SLEEP_SECONDS
+    sleep_seconds: float = WORKER_SLEEP_SECONDS
     state_file_path: Optional[str] = WORKER_STATE_FILE_PATH
     storage_paths: List[str] = field(default_factory=get_empty_str_list)
 
@@ -55,25 +59,27 @@ class WorkerConfig:
         with env.prefixed("WORKER_"):
             return cls(
                 content_max_bytes=env.int(name="CONTENT_MAX_BYTES", default=WORKER_CONTENT_MAX_BYTES),
-                heartbeat_interval_seconds=env.int(
+                difficulty_max=env.int(name="DIFFICULTY_MAX", default=WORKER_DIFFICULTY_MAX),
+                difficulty_min=env.int(name="DIFFICULTY_MIN", default=WORKER_DIFFICULTY_MIN),
+                heartbeat_interval_seconds=env.float(
                     name="HEARTBEAT_INTERVAL_SECONDS", default=WORKER_HEARTBEAT_INTERVAL_SECONDS
                 ),
                 job_types_blocked=env.list(name="JOB_TYPES_BLOCKED", default=get_empty_str_list()),
                 job_types_only=env.list(name="JOB_TYPES_ONLY", default=get_empty_str_list()),
-                kill_long_job_interval_seconds=env.int(
+                kill_long_job_interval_seconds=env.float(
                     name="KILL_LONG_JOB_INTERVAL_SECONDS", default=WORKER_KILL_LONG_JOB_INTERVAL_SECONDS
                 ),
-                kill_zombies_interval_seconds=env.int(
+                kill_zombies_interval_seconds=env.float(
                     name="KILL_ZOMBIES_INTERVAL_SECONDS", default=WORKER_KILL_ZOMBIES_INTERVAL_SECONDS
                 ),
                 max_disk_usage_pct=env.int(name="MAX_DISK_USAGE_PCT", default=WORKER_MAX_DISK_USAGE_PCT),
-                max_job_duration_seconds=env.int(
+                max_job_duration_seconds=env.float(
                     name="MAX_JOB_DURATION_SECONDS", default=WORKER_MAX_JOB_DURATION_SECONDS
                 ),
                 max_load_pct=env.int(name="MAX_LOAD_PCT", default=WORKER_MAX_LOAD_PCT),
                 max_memory_pct=env.int(name="MAX_MEMORY_PCT", default=WORKER_MAX_MEMORY_PCT),
                 max_missing_heartbeats=env.int(name="MAX_MISSING_HEARTBEATS", default=WORKER_MAX_MISSING_HEARTBEATS),
-                sleep_seconds=env.int(name="SLEEP_SECONDS", default=WORKER_SLEEP_SECONDS),
+                sleep_seconds=env.float(name="SLEEP_SECONDS", default=WORKER_SLEEP_SECONDS),
                 state_file_path=env.str(
                     name="STATE_FILE_PATH", default=WORKER_STATE_FILE_PATH
                 ),  # this environment variable is not expected to be set explicitly, it's set by the worker executor
@@ -169,6 +175,8 @@ PARQUET_AND_INFO_COMMIT_MESSAGE = "Update parquet files"
 PARQUET_AND_INFO_COMMITTER_HF_TOKEN = None
 PARQUET_AND_INFO_MAX_DATASET_SIZE = 100_000_000
 PARQUET_AND_INFO_MAX_EXTERNAL_DATA_FILES = 10_000
+PARQUET_AND_INFO_MAX_ROW_GROUP_BYTE_SIZE_FOR_COPY = 100_000_000
+PARQUET_AND_INFO_NO_MAX_SIZE_LIMIT_DATASETS: List[str] = []
 PARQUET_AND_INFO_SOURCE_REVISION = "main"
 PARQUET_AND_INFO_TARGET_REVISION = "refs/convert/parquet"
 PARQUET_AND_INFO_URL_TEMPLATE = "/datasets/%s/resolve/%s/%s"
@@ -181,6 +189,8 @@ class ParquetAndInfoConfig:
     committer_hf_token: Optional[str] = PARQUET_AND_INFO_COMMITTER_HF_TOKEN
     max_dataset_size: int = PARQUET_AND_INFO_MAX_DATASET_SIZE
     max_external_data_files: int = PARQUET_AND_INFO_MAX_EXTERNAL_DATA_FILES
+    max_row_group_byte_size_for_copy: int = PARQUET_AND_INFO_MAX_ROW_GROUP_BYTE_SIZE_FOR_COPY
+    no_max_size_limit_datasets: List[str] = field(default_factory=PARQUET_AND_INFO_NO_MAX_SIZE_LIMIT_DATASETS.copy)
     source_revision: str = PARQUET_AND_INFO_SOURCE_REVISION
     supported_datasets: List[str] = field(default_factory=get_empty_str_list)
     target_revision: str = PARQUET_AND_INFO_TARGET_REVISION
@@ -195,6 +205,15 @@ class ParquetAndInfoConfig:
                 commit_message=env.str(name="COMMIT_MESSAGE", default=PARQUET_AND_INFO_COMMIT_MESSAGE),
                 committer_hf_token=env.str(name="COMMITTER_HF_TOKEN", default=PARQUET_AND_INFO_COMMITTER_HF_TOKEN),
                 max_dataset_size=env.int(name="MAX_DATASET_SIZE", default=PARQUET_AND_INFO_MAX_DATASET_SIZE),
+                max_external_data_files=env.int(
+                    name="MAX_EXTERNAL_DATA_FILES", default=PARQUET_AND_INFO_MAX_EXTERNAL_DATA_FILES
+                ),
+                max_row_group_byte_size_for_copy=env.int(
+                    name="MAX_ROW_GROUP_BYTE_SIZE_FOR_COPY", default=PARQUET_AND_INFO_MAX_ROW_GROUP_BYTE_SIZE_FOR_COPY
+                ),
+                no_max_size_limit_datasets=env.list(
+                    name="NO_MAX_SIZE_LIMIT_DATASETS", default=PARQUET_AND_INFO_NO_MAX_SIZE_LIMIT_DATASETS.copy()
+                ),
                 source_revision=env.str(name="SOURCE_REVISION", default=PARQUET_AND_INFO_SOURCE_REVISION),
                 supported_datasets=env.list(name="SUPPORTED_DATASETS", default=get_empty_str_list()),
                 target_revision=env.str(name="TARGET_REVISION", default=PARQUET_AND_INFO_TARGET_REVISION),
@@ -213,7 +232,86 @@ class NumbaConfig:
     def from_env(cls) -> "NumbaConfig":
         env = Env(expand_vars=True)
         with env.prefixed("NUMBA_"):
-            return cls(path=env.str(name="NUMBA_CACHE_DIR", default=NUMBA_CACHE_DIR))
+            return cls(path=env.str(name="CACHE_DIR", default=NUMBA_CACHE_DIR))
+
+
+CONFIG_NAMES_MAX_NUMBER = 3_000
+
+
+@dataclass(frozen=True)
+class ConfigNamesConfig:
+    max_number: int = CONFIG_NAMES_MAX_NUMBER
+
+    @classmethod
+    def from_env(cls) -> "ConfigNamesConfig":
+        env = Env(expand_vars=True)
+        with env.prefixed("CONFIG_NAMES_"):
+            return cls(
+                max_number=env.int(name="MAX_NUMBER", default=CONFIG_NAMES_MAX_NUMBER),
+            )
+
+
+DUCKDB_INDEX_CACHE_DIRECTORY = None
+DUCKDB_INDEX_COMMIT_MESSAGE = "Update duckdb index file"
+DUCKDB_INDEX_COMMITTER_HF_TOKEN = None
+DUCKDB_INDEX_MAX_PARQUET_SIZE_BYTES = 100_000_000
+DUCKDB_INDEX_TARGET_REVISION = "refs/convert/parquet"
+DUCKDB_INDEX_URL_TEMPLATE = "/datasets/%s/resolve/%s/%s"
+DUCKDB_INDEX_EXTENSIONS_DIRECTORY: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DuckDbIndexConfig:
+    cache_directory: Optional[str] = DUCKDB_INDEX_CACHE_DIRECTORY
+    commit_message: str = DUCKDB_INDEX_COMMIT_MESSAGE
+    committer_hf_token: Optional[str] = DUCKDB_INDEX_COMMITTER_HF_TOKEN
+    target_revision: str = DUCKDB_INDEX_TARGET_REVISION
+    url_template: str = DUCKDB_INDEX_URL_TEMPLATE
+    max_parquet_size_bytes: int = DUCKDB_INDEX_MAX_PARQUET_SIZE_BYTES
+    extensions_directory: Optional[str] = DUCKDB_INDEX_EXTENSIONS_DIRECTORY
+
+    @classmethod
+    def from_env(cls) -> "DuckDbIndexConfig":
+        env = Env(expand_vars=True)
+        with env.prefixed("DUCKDB_INDEX_"):
+            return cls(
+                cache_directory=env.str(name="CACHE_DIRECTORY", default=DUCKDB_INDEX_CACHE_DIRECTORY),
+                commit_message=env.str(name="COMMIT_MESSAGE", default=DUCKDB_INDEX_COMMIT_MESSAGE),
+                committer_hf_token=env.str(name="COMMITTER_HF_TOKEN", default=DUCKDB_INDEX_COMMITTER_HF_TOKEN),
+                target_revision=env.str(name="TARGET_REVISION", default=DUCKDB_INDEX_TARGET_REVISION),
+                url_template=env.str(name="URL_TEMPLATE", default=DUCKDB_INDEX_URL_TEMPLATE),
+                max_parquet_size_bytes=env.int(
+                    name="MAX_PARQUET_SIZE_BYTES", default=DUCKDB_INDEX_MAX_PARQUET_SIZE_BYTES
+                ),
+                extensions_directory=env.str(name="EXTENSIONS_DIRECTORY", default=DUCKDB_INDEX_EXTENSIONS_DIRECTORY),
+            )
+
+
+DESCRIPTIVE_STATISTICS_CACHE_DIRECTORY = None
+DESCRIPTIVE_STATISTICS_HISTOGRAM_NUM_BINS = 10
+DESCRIPTIVE_STATISTICS_MAX_PARQUET_SIZE_BYTES = 100_000_000
+
+
+@dataclass(frozen=True)
+class DescriptiveStatisticsConfig:
+    cache_directory: Optional[str] = DESCRIPTIVE_STATISTICS_CACHE_DIRECTORY
+    histogram_num_bins: int = DESCRIPTIVE_STATISTICS_HISTOGRAM_NUM_BINS
+    max_parquet_size_bytes: int = DESCRIPTIVE_STATISTICS_MAX_PARQUET_SIZE_BYTES
+
+    @classmethod
+    def from_env(cls) -> "DescriptiveStatisticsConfig":
+        env = Env(expand_vars=True)
+        with env.prefixed("DESCRIPTIVE_STATISTICS_"):
+            return cls(
+                cache_directory=env.str(name="CACHE_DIRECTORY", default=DESCRIPTIVE_STATISTICS_CACHE_DIRECTORY),
+                histogram_num_bins=env.int(
+                    name="HISTOGRAM_NUM_BINS",
+                    default=DESCRIPTIVE_STATISTICS_HISTOGRAM_NUM_BINS,
+                ),
+                max_parquet_size_bytes=env.int(
+                    name="MAX_PARQUET_SIZE_BYTES", default=DESCRIPTIVE_STATISTICS_MAX_PARQUET_SIZE_BYTES
+                ),
+            )
 
 
 @dataclass(frozen=True)
@@ -221,6 +319,7 @@ class AppConfig:
     assets: AssetsConfig = field(default_factory=AssetsConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
     common: CommonConfig = field(default_factory=CommonConfig)
+    config_names: ConfigNamesConfig = field(default_factory=ConfigNamesConfig)
     datasets_based: DatasetsBasedConfig = field(default_factory=DatasetsBasedConfig)
     first_rows: FirstRowsConfig = field(default_factory=FirstRowsConfig)
     log: LogConfig = field(default_factory=LogConfig)
@@ -230,12 +329,16 @@ class AppConfig:
     queue: QueueConfig = field(default_factory=QueueConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     urls_scan: OptInOutUrlsScanConfig = field(default_factory=OptInOutUrlsScanConfig)
+    parquet_metadata: ParquetMetadataConfig = field(default_factory=ParquetMetadataConfig)
+    duckdb_index: DuckDbIndexConfig = field(default_factory=DuckDbIndexConfig)
+    descriptive_statistics: DescriptiveStatisticsConfig = field(default_factory=DescriptiveStatisticsConfig)
 
     @classmethod
     def from_env(cls) -> "AppConfig":
         return cls(
             assets=AssetsConfig.from_env(),
             common=CommonConfig.from_env(),
+            config_names=ConfigNamesConfig.from_env(),
             cache=CacheConfig.from_env(),
             datasets_based=DatasetsBasedConfig.from_env(),
             first_rows=FirstRowsConfig.from_env(),
@@ -246,4 +349,7 @@ class AppConfig:
             queue=QueueConfig.from_env(),
             worker=WorkerConfig.from_env(),
             urls_scan=OptInOutUrlsScanConfig.from_env(),
+            parquet_metadata=ParquetMetadataConfig.from_env(),
+            duckdb_index=DuckDbIndexConfig.from_env(),
+            descriptive_statistics=DescriptiveStatisticsConfig.from_env(),
         )
